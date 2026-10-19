@@ -884,8 +884,53 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
     return png
 
 
-def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
-    """把透明 PNG 合成到终端背景色上，并按需四周加留白像素。"""
+def composite_bg(png: str, bg: str, out: str, margin: int = 0,
+                 target_w: int | None = None,
+                 supersample: int = 1) -> str:
+    r"""
+    合成背景色，同时做超采样缩小与高度对齐。
+
+    1. 超采样缩小（解决"发糊"）
+       高 DPI 渲染的图先用 Lanczos 缩到目标宽度，再量化到 256 色。
+       比直接按目标 DPI 渲染的取样密度高，字形边缘更锐利。
+
+    2. 底部补透明像素到 6 的倍数（解决"黑带"）
+       sixel 每 6 行一个带，高度非 6 倍数时最后一个带不满，
+       终端填充条带剩余部分，视觉上出现黑带。
+
+    3. 合成背景色：-background 铺满透明像素。
+    """
+    work = os.path.dirname(png)
+
+    # --- 1. 超采样缩小 ---
+    w, h = _image_size(png)
+    if supersample and supersample > 1:
+        if target_w and target_w > 0 and w > target_w:
+            new_w = target_w
+            new_h = max(1, int(round(h * target_w / float(w))))
+        else:
+            new_w = max(1, w // supersample)
+            new_h = max(1, h // supersample)
+        scaled = os.path.join(work, "sixeltex-scaled.png")
+        subprocess.run(
+            [MAGICK, png, "-filter", "Lanczos",
+             "-resize", "%dx%d!" % (new_w, new_h), scaled],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=300, check=True)
+        png, w, h = scaled, new_w, new_h
+
+    # --- 2. 底部补到 6 的倍数 ---
+    pad = (-h) % 6
+    if pad:
+        padded = os.path.join(work, "sixeltex-padded.png")
+        subprocess.run(
+            [MAGICK, png, "-background", "none",
+             "-gravity", "south", "-splice", "0x%d" % pad, padded],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=300, check=True)
+        png, h = padded, h + pad
+
+    # --- 3. 留白 + 合成背景色 ---
     cmd = [MAGICK, png]
     if margin and margin > 0:
         cmd += ["-bordercolor", "transparent", "-border", str(margin)]
@@ -1046,13 +1091,19 @@ def _icat_path() -> str | None:
     return None
 
 
-def png_to_sixel_opaque(png: str, colors: int) -> None:
+def png_to_sixel_opaque(png: str, colors: int,
+                        disp_w: int | None = None,
+                        disp_h: int | None = None) -> None:
     r"""
     用 icat 展示图片，强制 sixel 协议。
 
     icat 默认会自动探测终端支持哪种图形协议（kitty / sixel / iterm），
     探测不到就报 "term graphics not available"。
     用 TERM_GRAPHICS=sixel 强制指定，无需终端应答任何探测序列。
+
+    disp_w / disp_h：按探测到的终端像素尺寸显式指定显示宽高。
+    icat 的 -W / -H 只认纯数字（实测 "100px" 无效、"50%" 会放大），
+    所以这里直接传整数像素值，避免它自行缩放导致尺寸漂移。
 
     参数 colors 已不再使用（由 icat 自己决定调色板），
     保留形参以便调用处不变。
@@ -1066,8 +1117,15 @@ def png_to_sixel_opaque(png: str, colors: int) -> None:
     env = dict(os.environ)
     env["TERM_GRAPHICS"] = "sixel"   # 强制 sixel，不让 icat 自动探测
 
+    cmd = [exe]
+    if disp_w and disp_w > 0:
+        cmd += ["-W", str(int(disp_w))]
+    if disp_h and disp_h > 0:
+        cmd += ["-H", str(int(disp_h))]
+    cmd.append(png)
+
     proc = subprocess.run(
-        [exe, png],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=300, env=env,
     )
@@ -1141,14 +1199,24 @@ def render(text: str, args: argparse.Namespace) -> None:
         fields["paper_w"] = "%.3fpt" % paper_w
         fields["paper_h"] = "%.3fpt" % max(paper_w * 4.0, 200.0)
 
-    # DPI：未显式指定时按终端字符格高反算，使公式字高与终端文字一致。
-    # 终端放大字体 -> cell_h 变大 -> DPI 变大 -> 图也跟着放大。
+    # DPI 分两层，这是解决"发糊"的关键：
+    #   base_dpi —— 目标数据的等效 DPI，使公式字高与终端文字一致
+    #               （终端放大 -> cell_h 变大 -> base_dpi 变大）
+    #   dpi      —— 实际光栅化用的 DPI = base_dpi * 超采样倍率
+    #
+    # 为什么超采样：直接用 base_dpi 渲染时取样密度低，字形边缘锯齿明显，
+    # 量化到 256 色后看着发糊。先用 N 倍分辨率渲染，再用 Lanczos 缩回目标
+    # 尺寸，等价于高质量抗锯齿，细节明显更清晰。
     if args.dpi is not None:
-        dpi = args.dpi
+        base_dpi = args.dpi
+        supersample = 1          # 显式指定 DPI 时不超采样，尊重用户意图
     else:
-        dpi = int(round(compute_dpi_for_cell_height(_CELL_H_PX, fontsize)))
-        if dpi < 36:
-            dpi = 36
+        base_dpi = int(round(compute_dpi_for_cell_height(_CELL_H_PX, fontsize)))
+        if base_dpi < 36:
+            base_dpi = 36
+        supersample = args.supersample
+
+    dpi = base_dpi * supersample
 
     fields["font_setup"] = build_font_setup(fields)
     fields["color_setup"] = build_color_setup(fields, fg, bg)
@@ -1182,11 +1250,6 @@ def render(text: str, args: argparse.Namespace) -> None:
         png = pdf_to_transparent_png(pdf, workdir_ctx, dpi)
 
 
-        if args.keep_png:
-            dest = os.path.abspath(args.keep_png)
-            shutil.copyfile(png, dest)
-            sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
-
         if args.transparent:
             # 透传模式（需显式开启）：只画字形像素，背景不写色
             if args.margin and args.margin > 0:
@@ -1201,8 +1264,23 @@ def render(text: str, args: argparse.Namespace) -> None:
         else:
             # 默认：把透明渲染结果合成到背景色，避免与终端背景撞色
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
-            composite_bg(png, bg, final, args.margin)
-            png_to_sixel_opaque(final, args.colors)
+            # 目标宽度 = 终端列数 * 字符格宽(px)，超采样后缩回这个尺寸
+            target_w = None
+            if not args.no_wrap and not args.dpi:
+                cell = _CELL_W_PX if _CELL_W_PX else DEFAULT_CELL_W_PX
+                target_w = int(round(columns * cell))
+            composite_bg(png, bg, final, args.margin,
+                         target_w=target_w, supersample=supersample)
+            # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）
+            if args.keep_png:
+                dest = os.path.abspath(args.keep_png)
+                shutil.copyfile(final, dest)
+                sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
+            # 把"最终图片的实际像素尺寸"显式传给 icat。
+            # 图片尺寸本身已按探测到的终端宽度算好，这里只是告诉 icat
+            # 按原样显示、不要再缩放（它的自动适配会引入尺寸漂移）。
+            final_w, final_h = _image_size(final)
+            png_to_sixel_opaque(final, args.colors, final_w, final_h)
     finally:
         if args.keep_dir:
             sys.stderr.write("sixeltex: 工作目录保留在 %s\n" % workdir_ctx)
@@ -1233,6 +1311,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="正文字号(pt)。默认自动探测终端字号（CSI 14t/18t），"
                         "探测失败回退 10pt。LaTeX 只认 10/11/12pt 档位，"
                         "其他值归到最接近档位并提示；连续缩放用 -S")
+    p.add_argument("--supersample", type=int, default=3, metavar="N",
+                   help="超采样倍率，默认 3。先按 N 倍分辨率渲染再缩回目标"
+                        "尺寸，显著减少锯齿、让字更清晰。设 1 关闭")
     p.add_argument("-d", "--dpi", type=int, default=None,
                    help="光栅化分辨率 DPI。默认按 -W 与字号自动反算，"
                         "使内容恰好占满终端列数；显式指定则完全由你决定")
