@@ -99,7 +99,8 @@ sixeltex ~/文档/论文.tex
 |---|---|---|
 | `-s`, `--size` | 自动探测 | 文档类字号(pt)。默认用 CSI 14t/18t 探测终端字号，探测失败回退 **10pt**。LaTeX 只认 10/11/12 档位，其他值静默归到最接近档位 |
 | `-S`, `--math-scale` | 不缩放 | 数学公式连续缩放倍数，如 `1.5` / `0.8`。实测 0.5/1.5/2.0 输出 39/115/153 px，线性生效 |
-| `-d`, `--dpi` | 自动反算 | 光栅化 DPI。默认按终端字符格高反算，使公式字高与终端文字一致 |
+| `-d`, `--dpi` | 自动反算 | 光栅化 DPI。默认按 `-W` 与字号反算，使内容恰好占满列数 |
+| `-W`, `--cell-width` | `8` | 终端一个字符格的像素宽，决定图占多少列 |
 | `-m`, `--margin` | `0` | 四周额外留白(像素)。内容边界由 ghostscript 自动算，通常不需要手动留白 |
 
 ### 颜色
@@ -141,40 +142,39 @@ sixeltex ~/文档/论文.tex
 
 **2. DPI 反算（关键）**
 
-Sixel 图在终端里按像素渲染，**不会自动缩放到终端列数**——
-sixel 头部就写死了 `"1;1;宽;高`，终端照像素原样画。
+Sixel 图在终端里按像素渲染，不会自动缩放到列。
+所以像素宽必须等于 `列数 × 字符格宽`。反推：
 
-所以 DPI 必须反算，让公式字高与终端字符格高一致：
+$$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 
-$$\mathrm{DPI} = \frac{\mathrm{cell\_h} \times 72}{\mathrm{fontsize}}$$
+列数被约掉了——**DPI 只取决于字符格宽和字号**。
+字号 10pt、cell_w 8px 时 DPI 自动算为 115。
 
-- `cell_h`：终端字符格的像素高度（CSI 14t/18t 实测）
-- `fontsize`：LaTeX 排版字号，固定 10pt
+这正是之前“长了接近一倍”的原因：固定 DPI=200 把本应占 640px 的
+80 列内容渲染成 1103px，约占 138 列。
 
-**缩放方向**：按 Ctrl++ 放大终端字体 → `cell_h` 变大 → DPI 变大 → 公式也跟着变大。
+实测（10pt, cell_w=8px）：
 
-> 这里踩过两个坑：先用固定 DPI=200，80 列内容渲染成 1103px（约 138 列）超宽近一倍；
-> 后来又把终端字号当 LaTeX 字号代入公式，导致终端放大时 DPI 反而下降、图变小。
-
-实测（LaTeX 10pt，不同终端字高）：
-
-| 终端字高 | DPI | 输出尺寸 |
+| 列数 | 输出像素宽 | 期望值 |
 |---|---|---|
-| 13px | 94 | 521×18 |
-| 16px | 115 | 637×22 |
-| 20px | 144 | 798×28 |
-| 26px | 187 | 1036×36 |
+| 40 | 318px | 320px |
+| 80 | 636px | 640px |
+| 120 | 942px | 960px |
+
+字符格宽默认 **8px**（多数终端 100% 缩放下的等宽字符格宽）。
+你的终端不是 8px 时，用 `-W` 改。
 
 **列数探测顺序**：`os.get_terminal_size()` → `shutil.get_terminal_size()`
 → `$COLUMNS` → 回退 80。已在伪终端里实测：设 60/120/200 列都能精确读到。
 
 相关参数：
 - `-w N`：强制指定列数
-- `-d DPI`：显式指定 DPI（默认按终端字高自动反算）
+- `-W PX`：字符格像素宽（默认 8）
+- `-d DPI`：显式指定 DPI（默认自动反算，显式指定则不反算）
 - `--no-wrap`：关闭折行
 - `--crop-width`：左右也按内容裁剪（**默认只裁上下、左右保留整页宽度**）
 
-### 环境与模板
+### 环境与模板### 环境与模板### 环境与模板### 环境与模板
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -318,9 +318,8 @@ sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
 |---|---|
 | `xelatex` | LaTeX 编译（XeTeX，支持 fontspec / xeCJK） |
 | `gs`（Ghostscript） | 计算矢量内容边界、写 CropBox |
-| `pdftocairo`（Poppler） | PDF → 透明 PNG |
+| `pdftocairo` / `pdftoppm`（Poppler） | PDF → 透明 PNG |
 | `pdftotext`（Poppler） | 提取字符级边界 |
-| `pdfinfo`（Poppler） | 读取页面尺寸 |
 | `magick`（ImageMagick） | 合成背景色、sixel 编码 |
 
 LaTeX 宏包：`ctex` `amsmath` `amssymb` `xcolor` `unicode-math` `graphicx` `geometry`。
@@ -332,26 +331,10 @@ sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
                  poppler-utils ghostscript imagemagick
 ```
 
-## 自包含性
-
-**Python 侧完全自包含**：仅用标准库（`argparse` `os` `re` `shutil`
-`subprocess` `sys` `tempfile`），不依赖任何 pip 包。
-
-**但它不是零依赖工具**：必须有 `xelatex`、Ghostscript、Poppler（`pdftocairo`
-`pdftotext` `pdfinfo`）、ImageMagick，以及带 `ctex` 的 TeX Live。
-这些在启动时会逐项 `shutil.which` 确认，缺哪个就报哪个，不会抛
-Python traceback。
-
-**字体**：默认用 `fc-list` 探本机实际存在的中文字体（Noto CJK 优先），
-都找不到时会提示用 `-C` 指定。字体不属于静态依赖——不同机器可用集合不同。
-
-**未打包**：没有 `pyproject.toml` / `requirements.txt`，也没有测试。
-它是一个**单文件脚本**，而不是可装配的 Python 包。
-
 ## 已知限制
 
 - **终端需支持 sixel**。可用性见 [arewesixelyet.com](https://www.arewesixelyet.com)。
-- **字号探测依赖终端响应 `CSI 14t`/`CSI 18t`**。不响应时按 16px 字高兜底，也可用 `-d` 手动指定 DPI。
+- **字符格宽默认 8px**。你的终端缩放不是 100% 时，用 `-W` 调整（见上文）。
 - **字号探测依赖 `CSI 14t`/`CSI 18t`**。终端不响应时回退 10pt，也可用 `-s` 手动指定。
 - **Sixel 无 alpha 通道**。默认把结果合成到探测到的终端背景色上；`--transparent` 可改为只画字形像素。
 
@@ -359,7 +342,7 @@ Python traceback。
 
 | 现象 | 处理 |
 |---|---|
-| 输出偏宽/偏窄 | `-v` 查看探测到的列数与 `cell_h`；探测不准时用 `-w`（列数）或 `-d`（DPI）手动指定 |
+| 输出偏宽/偏窄 | 调整 `-W`（字符格像素宽），或 `-v` 查看探测到的列数 |
 | 中文显示为方块 | 换 `-C` 指定本机存在的中文字体 |
 | 编译失败 | `-K` 保留工作目录，查看 `xelatex.log` |
 | 输出一片空白 | 确认终端支持 sixel；`-k out.png` 导出 PNG 验证内容本身是否正常 |
