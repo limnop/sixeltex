@@ -101,6 +101,8 @@ FALLBACK_COLUMNS = 80
 
 # 探测到的字符格宽度(px)，宽度自适应用；None 表示未探测到
 _CELL_W_PX: float | None = None
+# 探测到的字符格高度(px)，用来算 DPI 使公式字高对齐终端
+_CELL_H_PX: float | None = None
 
 
 def _read_dpi() -> float:
@@ -209,9 +211,10 @@ def detect_fontsize_pt(verbose: bool = False) -> float:
     cell_w = px_w / ch_w
     dpi = _read_dpi()
     pt = cell_h / dpi * 72.0
-    # 记录字符格宽度(px)，宽度自适应要用
-    global _CELL_W_PX
+    # 记录字符格尺寸(px)：宽用于宽度估算，高用于算 DPI
+    global _CELL_W_PX, _CELL_H_PX
     _CELL_W_PX = cell_w
+    _CELL_H_PX = cell_h
     if verbose:
         sys.stderr.write(
             "sixeltex: 终端 %dx%d 字符, %dx%d 像素, 字符格 %.1fx%.1fpx, "
@@ -405,32 +408,37 @@ def detect_bg() -> str:
 # ---------------------------------------------------------------------------
 # 4. 字体与颜色字段生成
 # ---------------------------------------------------------------------------
-# 终端字符格的像素宽度。Sixel 图在终端里按像素渲染，
-# 所以"图片像素宽 / cell_w = 占用的列数"。
-# 8px 是多数终端在 100% 缩放下的等宽字符格宽（16px 字号等宽字体的半宽）。
-# 实测不准时用 -W 覆盖。
-DEFAULT_CELL_W_PX = 8.0
-
-
-def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
+def compute_dpi_for_cell_height(cell_h_px: float | None,
+                                fontsize_pt: float) -> float:
     r"""
-    反算 DPI，使"按列数限宽排版"的内容恰好占满 columns 列。
+    反算 DPI，使公式的字高与终端字符格一致。
 
-    推导：
-      LaTeX 里可用文本宽 = (columns/2) 个中文字宽，1 个中文字宽 = 1em = fontsize_pt。
-      所以内容宽 = (columns/2) * fontsize_pt  (单位 pt)
-      该内容渲染成像素宽 = 内容宽 * DPI / 72
-      要让它在终端占 columns 列，需 像素宽 = columns * cell_w_px
-      联立：
-          (columns/2) * fontsize_pt * DPI / 72 = columns * cell_w_px
-          => DPI = 2 * cell_w_px * 72 / fontsize_pt
-      注意 columns 被约掉了——DPI 只取决于 cell_w 和字号，
-      与终端列数无关。这正是之前固定 DPI=200 导致超宽近一倍的原因：
-      80 列内容本该占 640px，200 DPI 下却渲染成 1103px（约 138 列）。
+    目标：公式中文字高(px) == 终端字符格高(px)
+      LaTeX 里 1em = fontsize_pt (pt)
+      渲染后字高(px) = fontsize_pt * DPI / 72
+      cell_h_px = fontsize_pt * DPI / 72
+      => DPI = cell_h_px * 72 / fontsize_pt
+
+    缩放方向（这是之前搞反的地方）：
+      Ctrl++ 放大终端字体 -> 字符格变高 -> cell_h_px 变大 -> DPI 变大
+      -> 渲染出的公式字变大，与终端文字同比例。
+
+    为什么不能用 cell_w 算：
+      曾用 DPI = 2*cell_w*72/term_pt，但 cell_w 与 term_pt 都由同一个字符格
+      导出（term_pt = cell_h/screen_dpi*72），宽高比固定时代数上互相约掉，
+      DPI 恒为屏幕 DPI 附近，终端放大时毫无变化——表现为"缩放没反应"。
+
+    cell_h_px 为 None（终端不响应 CSI 查询）时，用本机 DPI 和一个合理的
+    字高假设（16px，约等于 12pt@96dpi 的行高）兜底。
     """
-    if fontsize_pt <= 0 or cell_w_px <= 0:
+    if fontsize_pt <= 0:
         return 72.0
-    return 2.0 * cell_w_px * 72.0 / fontsize_pt
+    if not cell_h_px or cell_h_px <= 0:
+        # 兜底：按 16px 字高算，接近常见终端默认
+        cell_h_px = 16.0
+    dpi = cell_h_px * 72.0 / fontsize_pt
+    # 夹到合理范围，避免极端值导致图片过大/过小
+    return max(36.0, min(dpi, 600.0))
 
 
 def build_width_setup(columns: int, enabled: bool = True) -> tuple[str, str]:
@@ -1081,13 +1089,17 @@ def render(text: str, args: argparse.Namespace) -> None:
     fg = args.color if args.color else detect_fg()
     bg = args.bgcolor if args.bgcolor else detect_bg()
 
-    # 字号：命令行 > 探测终端字号 > 10pt 兜底
+    # 字号分两层，切勿混淆：
+    #   fontsize    —— LaTeX 排版用的字号(pt)，固定档位，默认 10
+    #   term_pt     —— 探测到的终端字号(pt)，**只用来算 DPI**
+    #
+    # 曾把两者弄成同一个变量，导致缩放方向反了：
+    # 终端字号变大 -> fontsize 变大 -> DPI 变小 -> 图反而变小。
+    term_pt = detect_fontsize_pt(args.verbose)
     if args.size is not None:
         fontsize = args.size
     else:
-        fontsize = detect_fontsize_pt(args.verbose)
-    # 字号接入文档类选项。LaTeX 只认离散档位(10/11/12pt)，
-    # 任意 pt 值归到最接近的档位并如实告知。
+        fontsize = FALLBACK_FONTSIZE_PT
     fields["class_opts"] = _size_to_class_opt(fontsize)
 
     # 终端宽度(列数)：按列数限制排版宽度，让 LaTeX 自己换行
@@ -1103,12 +1115,12 @@ def render(text: str, args: argparse.Namespace) -> None:
         fields["paper_w"] = "%.3fpt" % paper_w
         fields["paper_h"] = "%.3fpt" % max(paper_w * 4.0, 200.0)
 
-    # DPI：未显式指定时按 cell_w 和字号反算，保证内容恰好占满 columns 列。
-    # 固定 200 DPI 会让 80 列的内容渲染成约 138 列宽（超宽近一倍）。
+    # DPI：未显式指定时按终端字符格高反算，使公式字高与终端文字一致。
+    # 终端放大字体 -> cell_h 变大 -> DPI 变大 -> 图也跟着变大。
     if args.dpi is not None:
         dpi = args.dpi
     else:
-        dpi = int(round(compute_dpi_for_columns(args.cell_w, fontsize)))
+        dpi = int(round(compute_dpi_for_cell_height(_CELL_H_PX, fontsize)))
         if dpi < 36:
             dpi = 36
 
@@ -1127,9 +1139,11 @@ def render(text: str, args: argparse.Namespace) -> None:
         mode = "表达式"
 
     if args.verbose:
+        ch = ("cell_h=%.1fpx" % _CELL_H_PX) if _CELL_H_PX else "cell_h=未探测(按16px兜底)"
         sys.stderr.write(
-            "sixeltex: 模式=%s 前景=%s 背景=%s dpi=%d 字号=%.2fpt 终端=%d列%s\n"
-            % (mode, fg, bg, dpi, fontsize, columns,
+            "sixeltex: 模式=%s 前景=%s 背景=%s 终端=%d列 %s "
+            "字号=%.2fpt dpi=%d%s\n"
+            % (mode, fg, bg, columns, ch, fontsize, dpi,
                " 透传" if args.transparent else " 合成背景"))
 
     if args.dry_run:
@@ -1192,16 +1206,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("input", nargs="?", default=None,
                    help="LaTeX 表达式，或完整 .tex 文件路径；省略则读标准输入")
     p.add_argument("-s", "--size", type=float, default=None,
-                   help="正文字号(pt)。默认自动探测终端字号（CSI 14t/18t），"
-                        "探测失败回退 10pt。LaTeX 只认 10/11/12pt 档位，"
-                        "其他值归到最接近档位并提示；连续缩放用 -S")
+                   help="LaTeX 排版字号(pt)，默认 10。只影响字体"
+                        "与数学符号的相对比例；图的整体大小由终端字号"
+                        "自动决定。LaTeX 只认 10/11/12pt 档位，其他值静默归档；"
+                        "连续缩放用 -S")
     p.add_argument("-d", "--dpi", type=int, default=None,
-                   help="光栅化分辨率 DPI。默认按 -W 与字号自动反算，"
-                        "使内容恰好占满终端列数；显式指定则完全由你决定")
-    p.add_argument("-W", "--cell-width", dest="cell_w", type=float,
-                   default=DEFAULT_CELL_W_PX,
-                   help="终端一个字符格的像素宽，默认 %g。"
-                        "决定输出图在终端里占多少列，不准时改它" % DEFAULT_CELL_W_PX)
+                   help="光栅化分辨率 DPI。默认按终端字符格高自动反算，"
+                        "使公式字高与终端文字一致（终端放大图也跟着放大）；"
+                        "显式指定则完全由你决定")
     p.add_argument("-c", "--color", default=None,
                    help="前景色，命名色或 #RRGGBB。默认 OSC 探测终端色")
     p.add_argument("-b", "--bgcolor", default=None,
