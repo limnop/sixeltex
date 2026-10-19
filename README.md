@@ -318,8 +318,9 @@ sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
 |---|---|
 | `xelatex` | LaTeX 编译（XeTeX，支持 fontspec / xeCJK） |
 | `gs`（Ghostscript） | 计算矢量内容边界、写 CropBox |
-| `pdftocairo` / `pdftoppm`（Poppler） | PDF → 透明 PNG |
+| `pdftocairo`（Poppler） | PDF → 透明 PNG |
 | `pdftotext`（Poppler） | 提取字符级边界 |
+| `pdfinfo`（Poppler） | 读取页面尺寸 |
 | `magick`（ImageMagick） | 合成背景色、sixel 编码 |
 
 LaTeX 宏包：`ctex` `amsmath` `amssymb` `xcolor` `unicode-math` `graphicx` `geometry`。
@@ -330,6 +331,22 @@ Debian/Ubuntu 下大致是：
 sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
                  poppler-utils ghostscript imagemagick
 ```
+
+## 自包含性
+
+**Python 侧完全自包含**：仅用标准库（`argparse` `os` `re` `shutil`
+`subprocess` `sys` `tempfile`），不依赖任何 pip 包。
+
+**但它不是零依赖工具**：必须有 `xelatex`、Ghostscript、Poppler（`pdftocairo`
+`pdftotext` `pdfinfo`）、ImageMagick，以及带 `ctex` 的 TeX Live。
+这些在启动时会逐项 `shutil.which` 确认，缺哪个就报哪个，不会抛
+Python traceback。
+
+**字体**：默认用 `fc-list` 探本机实际存在的中文字体（Noto CJK 优先），
+都找不到时会提示用 `-C` 指定。字体不属于静态依赖——不同机器可用集合不同。
+
+**未打包**：没有 `pyproject.toml` / `requirements.txt`，也没有测试。
+它是一个**单文件脚本**，而不是可装配的 Python 包。
 
 ## 已知限制
 

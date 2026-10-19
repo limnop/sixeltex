@@ -259,8 +259,9 @@ def detect_terminal_columns() -> int:
     return FALLBACK_COLUMNS
 
 
-# 探明的本机中文字体候选（按优先级）。只在使用者未指定字体时用于自动挑选。
-# 已实测：这三个名字 fontspec 都能直接引用，零缺字。
+# 中文字体候选（按优先级）。不直接取第一个——
+# 先用 fc-list 查本机到底装了哪些，再挑第一个真实存在的。
+# 曾因硬编码取 FONT_CANDIDATES_CJK[0] 而在无 Noto 的机器上直接编译失败。
 FONT_CANDIDATES_CJK = [
     "Noto Serif CJK SC",
     "Noto Sans CJK SC",
@@ -281,6 +282,8 @@ FONT_CANDIDATES_MATH = [
 XELATEX = "xelatex"
 GS = "gs"
 PDFTOCAIRO = "pdftocairo"
+PDFTOTEXT = "pdftotext"
+PDFINFO = "pdfinfo"
 MAGICK = "magick"
 
 
@@ -294,6 +297,8 @@ def check_dependencies() -> None:
         ("xelatex", XELATEX),
         ("ghostscript (gs)", GS),
         ("pdftocairo", PDFTOCAIRO),
+        ("pdftotext", PDFTOTEXT),
+        ("pdfinfo", PDFINFO),
         ("ImageMagick (magick)", MAGICK),
     ]:
         resolved = shutil.which(path)
@@ -310,6 +315,7 @@ def check_dependencies() -> None:
 
 def _const_name(path: str) -> str:
     return {"xelatex": "XELATEX", "gs": "GS", "pdftocairo": "PDFTOCAIRO",
+            "pdftotext": "PDFTOTEXT", "pdfinfo": "PDFINFO",
             "magick": "MAGICK"}[path]
 
 
@@ -486,13 +492,64 @@ def _size_to_class_opt(size: float) -> str:
     return best[1]
 
 
+_FONT_CACHE: dict[str, list[str]] | None = None
+
+
+def _installed_fonts() -> list[str]:
+    r"""
+    用 fc-list 拿本机已安装的字体族名列表（小写，去掉 style 后缀）。
+    失败返回空列表。结果缓存，避免每行 fontspec 设置都跑一次 fc-list。
+    """
+    global _FONT_CACHE
+    if _FONT_CACHE is not None:
+        return _FONT_CACHE.get("all", [])
+    names: list[str] = []
+    try:
+        r = subprocess.run(["fc-list", ":", "family"], capture_output=True,
+                           text=True, timeout=60)
+        seen = set()
+        for line in r.stdout.splitlines():
+            # fc-list 可能一行给多个族名，用逗号分隔
+            for fam in line.split(","):
+                fam = fam.strip()
+                if fam and fam.lower() not in seen:
+                    seen.add(fam.lower())
+                    names.append(fam)
+    except (OSError, subprocess.SubprocessError):
+        names = []
+    _FONT_CACHE = {"all": names}
+    return names
+
+
+def pick_first_available(candidates: list[str]) -> str | None:
+    """
+    从候选里挑第一个本机真实存在的字体族名（不区分大小写匹配）。
+    全部不存在时返回 None。
+    """
+    installed = _installed_fonts()
+    if not installed:
+        # fc-list 不可用：无法判断，回退第一个候选（至少给出可用的默认）
+        return candidates[0] if candidates else None
+    lower = {n.lower(): n for n in installed}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return cand
+    return None
+
+
 def build_font_setup(fields: dict) -> str:
     """按模板字段生成 fontspec/xeCJK 设置。"""
     cjk = fields.get("cjk_font")
     latin = fields.get("latin_font")
     math = fields.get("math_font")
     if not cjk:
-        cjk = FONT_CANDIDATES_CJK[0]
+        # 未指定时探本机实际存在的中文字体
+        cjk = pick_first_available(FONT_CANDIDATES_CJK)
+        if cjk is None:
+            sys.stderr.write(
+                "sixeltex: 未找到任何已知的中文字体，请用 -C 指定一个"
+                "（如 -C 'Noto Serif CJK SC'），或安装 Noto CJK 字体。\n")
+            sys.exit(2)
     lines = []
     if latin:
         lines.append(r"\setmainfont{%s}" % latin)
@@ -710,7 +767,7 @@ def _bbox_from_pdftotext(pdf: str) -> tuple[float, float, float, float] | None:
 
     返回 (x0, y0_top, x1, y1_top)；失败返回 None。
     """
-    proc = subprocess.run(["pdftotext", "-bbox", pdf, "-"],
+    proc = subprocess.run([PDFTOTEXT, "-bbox", pdf, "-"],
                           capture_output=True, text=True, timeout=300)
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
@@ -756,7 +813,7 @@ def crop_pdf(pdf: str, workdir: str, pad_pt: float = 1.0,
     if tb is not None:
         tx0, ty0_top, tx1, ty1_top = tb
         # 取页面高度换算
-        info = subprocess.run(["pdfinfo", pdf], capture_output=True, text=True,
+        info = subprocess.run([PDFINFO, pdf], capture_output=True, text=True,
                               timeout=120)
         # 注意："Page size:  595.28 x 841.89 pts (A4)" 拆开后
         #   ['Page','size:','595.28','x','841.89','pts','(A4)']
@@ -797,7 +854,7 @@ def crop_pdf(pdf: str, workdir: str, pad_pt: float = 1.0,
     y1 = max(b[3] for b in boxes)
 
     # 安全边距，并夹到页面内
-    info = subprocess.run(["pdfinfo", pdf], capture_output=True, text=True,
+    info = subprocess.run([PDFINFO, pdf], capture_output=True, text=True,
                           timeout=120)
     page_w = page_h2 = 0.0
     for line in info.stdout.splitlines():
