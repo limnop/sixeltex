@@ -344,7 +344,7 @@ sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
 | 现象 | 处理 |
 |---|---|
 | 输出偏宽/偏窄 | 调整 `-W`（字符格像素宽），或 `-v` 查看探测到的列数 |
-| 中文显示为方块 | 换 `-C` 指定一个本机确实存在的中文字体（`fc-list :lang=zh family` 可查） |
+| 中文显示为方块 | 换 `-C` 指定一个实际存在的中文字体（`fc-list :lang=zh family` 可查） |
 | 编译失败 | `-K` 保留工作目录，查看 `xelatex.log` |
 | 输出一片空白 | 确认终端支持 sixel；`-k out.png` 导出 PNG 验证内容本身是否正常 |
 
