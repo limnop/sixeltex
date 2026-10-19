@@ -466,7 +466,11 @@ def build_width_setup(columns: int, enabled: bool = True) -> tuple[str, str]:
         "\n"
         r"\SixeltexWidth=%.4f\wd0" % halfwidth_units
     )
-    prefix = r"\parbox{\SixeltexWidth}{\raggedright " 
+    # 关键：不能用 SixeltexWidth 直接当 parbox 宽度。
+    # 页面宽 = columns/2 * fontsize，而 SixeltexWidth 恰好也是这个值，
+    # 两者相等时 parbox 没有余量，LaTeX 不会折行而是溢出一行。
+    # 改用 \linewidth（页面可用宽度），SixeltexWidth 只用来控制页面宽度。
+    prefix = r"\parbox{\linewidth}{\raggedright "
     return setup, prefix
 
 
@@ -482,7 +486,7 @@ def wrap_body_for_width(body: str, width_setup: str) -> str:
     # 纯行间公式 / 纯数学环境：不包（其宽度天然由内容决定）
     if stripped.startswith("\\[") or stripped.startswith("\\begin{equation"):
         return body
-    return r"\parbox{\SixeltexWidth}{\raggedright " + stripped + "}"
+    return r"\parbox{\linewidth}{\raggedright " + stripped + "}"
 
 
 def _size_to_class_opt(size: float) -> str:
@@ -1111,9 +1115,17 @@ def render(text: str, args: argparse.Namespace) -> None:
     # 一列 = 半个中文字宽 = fontsize/2 pt，故列数/2 * fontsize。
     # 高度留足够大，上下再按内容裁剪。
     if not args.no_wrap:
-        paper_w = (columns / 2.0) * fontsize
+        # 页面宽度必须比"columns/2 个中文字宽"略宽。
+        # 若二者严格相等，\textwidth 会比一行内容窄 1~2pt，而中文单字宽 10pt，
+        # 装不下就整段溢出成单行，折行完全失效（曾因此弄丢折行）。
+        content_w = (columns / 2.0) * fontsize
+        padding = max(content_w * 0.02, 4.0)   # 2% 余量，至少 4pt
+        paper_w = content_w + padding * 2
         fields["paper_w"] = "%.3fpt" % paper_w
-        fields["paper_h"] = "%.3fpt" % max(paper_w * 4.0, 200.0)
+        # 页面高度要足够容纳多行内容。曾用 paper_w*4，折行后仍会溢出：
+        # 文字超出页面顶部后被 PDF 裁掉，表现为"第二行不见了"。
+        # 这里给一个足够大的固定高度，反正最后按内容边界裁剪。
+        fields["paper_h"] = "2000.000pt"
 
     # DPI：未显式指定时按终端字符格高反算，使公式字高与终端文字一致。
     # 终端放大字体 -> cell_h 变大 -> DPI 变大 -> 图也跟着变大。
