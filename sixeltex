@@ -11,7 +11,7 @@ sixeltex — 渲染 LaTeX / 中文 / 数学表达式为 sixel 终端图形
   表达式模式   输入被包进模板的 \\begin{document} ... \\end{document} 之间
   完整文件模式 输入本身就是合法 .tex，直接交给 xelatex 编译
 
-依赖（本机均已探明存在）：
+依赖（由 check_dependencies() 逐一确认，缺失即报错退出）：
   xelatex (XeTeX 3.141592653) / gs (GPL Ghostscript) / pdftocairo / magick (ImageMagick)
   LaTeX 宏包：ctex, amsmath, amssymb, xcolor, unicode-math
 """
@@ -67,7 +67,7 @@ DEFAULTS = {
     "extra_packages": "",
     # 额外 preamble 内容，默认空
     "preamble_extra": "",
-    # 字体设置（CJK + 数学）。空串时由 build_font_setup() 自动挑选本机可用字体
+    # 字体设置（CJK + 数学）。空串时由 build_font_setup() 从内置候选表挑选
     "font_setup": "",
     # 颜色设置。空串时由 build_color_setup() 生成
     "color_setup": "",
@@ -87,13 +87,13 @@ DEFAULT_BG = "#232627"
 # ---------------------------------------------------------------------------
 # 字号探测原理：
 #   向终端发 CSI 14 t（查询文本区像素尺寸）和 CSI 18 t（查询文本区字符尺寸），
-#   两者相除得到"字符格高度(像素)"，再按本机 DPI 折算成 pt：
+#   两者相除得到"字符格高度(像素)"，再按 DPI 折算成 pt：
 #       字号(pt) = 字符格高(px) / DPI * 72
 #   任一环节拿不到就回退，最终回退 FALLBACK_FONTSIZE_PT（10pt）。
 FALLBACK_FONTSIZE_PT = 10.0
 
-# 本机探明的 DPI（~/.Xresources 的 Xft.dpi = 96）。
-# 这是"默认值不可信"原则下的显式实测值；探测失败时用它折算。
+# 缺省 DPI。实际取值顺序：$SIXELTEX_DPI -> xrdb 查到的 Xft.dpi -> 本值。
+# X11 会话的 Xft.dpi 常见为 96；Wayland 下通常查不到，也会落到本值。
 PROBED_DPI = 96.0
 
 # 宽度回退：shutil.get_terminal_size() 拿不到时用 80 列
@@ -107,8 +107,11 @@ _CELL_H_PX: float | None = None
 
 def _read_dpi() -> float:
     """
-    读取本机 DPI。顺序：$SIXELTEX_DPI -> Xft.dpi(xrdb) -> 96。
+    读取 DPI。顺序：$SIXELTEX_DPI -> Xft.dpi(xrdb) -> 缺省值。
     只读操作，失败不影响主流程。
+
+    xrdb 只在 X11 会话下存在；Wayland / Windows / macOS 上要么没有这个
+    命令、要么没有 Xft.dpi 资源，此时由 except 分支接住并落到缺省值。
     """
     env = os.environ.get("SIXELTEX_DPI")
     if env:
@@ -142,12 +145,17 @@ def _osc_geometry_query(timeout: float = 0.4) -> tuple[int, int, int, int] | Non
     CSI 14 t -> 终端回复 CSI 4 ; 高 ; 宽 t
     CSI 18 t -> 终端回复 CSI 8 ; 行 ; 列 t
     只在真实 TTY 下发；非 TTY 直接放弃（不阻塞、不报错）。
+    select/termios/tty 均为 Unix 专有模块，故在函数内导入：
+    Windows 上 import 即失败，走 ImportError 分支返回 None（而非崩掉）。
     """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
-    import select
-    import termios
-    import tty
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        return None
     try:
         fd = sys.stdin.fileno()
         orig = termios.tcgetattr(fd)
@@ -262,8 +270,8 @@ def detect_terminal_columns() -> int:
     return FALLBACK_COLUMNS
 
 
-# 探明的本机中文字体候选（按优先级）。只在使用者未指定字体时用于自动挑选。
-# 已实测：这三个名字 fontspec 都能直接引用，零缺字。
+# 中文字体候选（按优先级）。只在使用者未指定字体时用于挑选，
+# 取表中第一个被 fontspec 成功引用的名字。
 FONT_CANDIDATES_CJK = [
     "Noto Serif CJK SC",
     "Noto Sans CJK SC",
@@ -275,16 +283,22 @@ FONT_CANDIDATES_LATIN = [
     "Noto Serif",
     "Liberation Serif",
 ]
-# 本机探明的数学字体（fc-list 实测只有这一个带 MATH 表的可用字体）
+# 数学字体候选。表中第一个会被用作 \\setmathfont，需带 MATH 表，
+# 否则 unicode-math 会退化成传统字体、数学符号可能缺字。
 FONT_CANDIDATES_MATH = [
     "Noto Sans Math",
 ]
 
-# 探明的可用命令（本机已逐一 command -v 确认）
+# 外部命令名。Windows 上需自行确认这些命令在 PATH 中（TeX Live 的
+# 自带 shell 脚本 xelatex.bat 可用；gs/pdftocairo/magick 同理）。
 XELATEX = "xelatex"
 GS = "gs"
 PDFTOCAIRO = "pdftocairo"
-MAGICK = "magick"
+# ImageMagick 的命令名在大版本间变过：IM7 起主命令是 `magick`，
+# IM6 只有 `convert`（IM7 也保留 `convert` 但会打弃用警告）。
+# 因此不写死单个名字，由 check_dependencies() 按顺序探测。
+MAGICK_CANDIDATES = ("magick", "convert")
+MAGICK = MAGICK_CANDIDATES[0]
 
 
 # ---------------------------------------------------------------------------
@@ -293,27 +307,28 @@ MAGICK = "magick"
 def check_dependencies() -> None:
     """确认外部命令都在。任一缺失立即报错并说明缺什么。"""
     missing = []
-    for name, path in [
-        ("xelatex", XELATEX),
-        ("ghostscript (gs)", GS),
-        ("pdftocairo", PDFTOCAIRO),
-        ("ImageMagick (magick)", MAGICK),
-    ]:
-        resolved = shutil.which(path)
+    # (显示名, 候选命令名元组, 对应模块级常量名)
+    probes = [
+        ("xelatex", ("xelatex",), "XELATEX"),
+        ("ghostscript (gs)", ("gs",), "GS"),
+        ("pdftocairo", ("pdftocairo",), "PDFTOCAIRO"),
+        ("ImageMagick", MAGICK_CANDIDATES, "MAGICK"),
+    ]
+    for name, candidates, const in probes:
+        resolved = None
+        for cand in candidates:
+            resolved = shutil.which(cand)
+            if resolved is not None:
+                break
         if resolved is None:
             missing.append(name)
         else:
             # 把探到的真实路径写回常量，后续一律用绝对路径调用
-            globals()[_const_name(path)] = resolved
+            globals()[const] = resolved
     if missing:
         sys.stderr.write("sixeltex: 缺少依赖: " + ", ".join(missing) + "\n")
         sys.stderr.write("  请先安装后重试。\n")
         sys.exit(127)
-
-
-def _const_name(path: str) -> str:
-    return {"xelatex": "XELATEX", "gs": "GS", "pdftocairo": "PDFTOCAIRO",
-            "magick": "MAGICK"}[path]
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +338,13 @@ def _osc_query(ps: int) -> str | None:
     """向终端查询默认前景(10)/背景(11)色。非 TTY 或超时返回 None。"""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
-    import select
-    import termios
-    import tty
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        # Windows 无这三个模块；颜色探测本就只是优化项，直接放弃即可
+        return None
     try:
         fd = sys.stdin.fileno()
         orig = termios.tcgetattr(fd)
@@ -941,10 +960,17 @@ def composite_bg(png: str, bg: str, out: str, margin: int = 0,
 
 
 def _image_size(png: str) -> tuple[int, int]:
+    """读 PNG 像素尺寸。用 ImageMagick 的 %w/%h 格式，避免自解析 PNG 头。"""
     out = subprocess.run([MAGICK, png, "-format", "%w %h", "info:"],
                          capture_output=True, text=True, timeout=120)
-    w, h = out.stdout.split()
-    return int(w), int(h)
+    if out.returncode != 0:
+        raise RuntimeError("无法读取图片尺寸: %s" % png)
+    try:
+        w, h = out.stdout.split()
+        return int(w), int(h)
+    except ValueError:
+        raise RuntimeError(
+            "无法解析图片尺寸（输出 %r）: %s" % (out.stdout.strip(), png))
 
 
 def encode_transparent_sixel(png: str, fg: str) -> bytes:
@@ -955,9 +981,10 @@ def encode_transparent_sixel(png: str, fg: str) -> bytes:
     （sixel 协议本身无 alpha 通道，只能用"不写背景色"达到透传效果）。
 
     为什么不用 ImageMagick 的 sixel coder：它无法表达"背景不写色"，
-    会把透明区合成成某个不透明色。libsixel 的 img2sixel 在本机输出恒为
-    0 字节（已实测），故自写编码器。
-    本编码器输出已用 libsixel 自带的 sixel2png 反向解码验证通过。
+    会把 alpha=0 的区域量化成某个不透明色（实测：全透明图被编码成
+    颜色 0 = 黑色铺满）。libsixel 的 img2sixel 在部分构建下输出恒为
+    0 字节，故自写编码器。本编码器输出已用 libsixel 自带的 sixel2png
+    反向解码验证通过。
     """
     # 取 RGBA 原始像素
     proc = subprocess.run([MAGICK, png, "-depth", "8", "rgba:-"],
@@ -1065,6 +1092,7 @@ def _strip_icat_filename_prefix(data: bytes) -> bytes:
     icat 的输出形如：  b"/tmp/xxx.png:\n\x1bP0;0;8q..."
     那份文件名会被终端当普通文本显示，必须去掉。
     找到第一个 sixel DCS 起始序列 ESC P 的位置，从那里截取。
+    取首个而非最后一个，是为了保留文件名行之后可能出现的其它控制序列。
     """
     idx = data.find(b"\x1bP")
     if idx > 0:
@@ -1075,7 +1103,7 @@ def _strip_icat_filename_prefix(data: bytes) -> bytes:
 def _icat_path() -> str | None:
     r"""
     定位 icat。优先 PATH，再回退到常见安装目录
-    （本机实测：/home/limnop/go/bin/icat 不在 PATH 里）。
+    （Go 的 `go install` 默认落在 ~/go/bin，该目录常不在 PATH 里）。
     """
     found = shutil.which("icat")
     if found:
@@ -1342,7 +1370,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-e", "--env", dest="math_env", default=None,
                    help="强制指定数学环境，如 align* / equation / gather")
     p.add_argument("-C", "--cjk-font", dest="cjk_font", default=None,
-                   help="中文字体名。默认自动探测本机可用中文字体")
+                   help="中文字体名。默认从内置候选表依次挑选："
+                        "Noto Serif CJK SC / Noto Sans CJK SC / "
+                        "Sarasa Term SC Nerd Font / AR PL UMing CN")
     p.add_argument("-L", "--latin-font", dest="latin_font", default=None,
                    help="西文字体名")
     p.add_argument("-M", "--math-font", dest="math_font", default=None,

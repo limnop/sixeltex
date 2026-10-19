@@ -182,16 +182,16 @@ $$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 | `-P`, `--packages` | — | 追加宏包，空格分隔，如 `-P tikz pgfplots` |
 | `-A`, `--preamble` | — | 追加 preamble 原文，如 `-A '\usepackage{multirow}'` |
 | `-e`, `--env` | 自动 | 强制指定数学环境，如 `-e 'align*'` |
-| `-C`, `--cjk-font` | 自动探测 | 中文字体名 |
+| `-C`, `--cjk-font` | 内置候选表 | 中文字体名 |
 | `-L`, `--latin-font` | — | 西文字体名 |
 | `-M`, `--math-font` | — | 数学字体名 |
 
-**本机探明的可用字体**（均已实测 fontspec 可直接引用，零缺字）：
+**可用字体候选**（未指定 `-C` / `-L` / `-M` 时依次尝试，表中第一个被 fontspec 成功引用的生效）：
 
 | 用途 | 字体名 |
 |---|---|
 | 中文 | `Noto Serif CJK SC`（默认）、`Noto Sans CJK SC`、`Sarasa Term SC Nerd Font`、`AR PL UMing CN` |
-| 数学 | `Noto Sans Math`（本机唯一带 MATH 表的可用字体） |
+| 数学 | `Noto Sans Math`（需带 MATH 表） |
 | 西文 | `Latin Modern Roman`、`Noto Serif`、`Liberation Serif` |
 
 > 字体名含空格必须加引号：`-C 'Noto Sans CJK SC'`
@@ -221,17 +221,18 @@ OSC 探测要求 stdin/stdout 都是 TTY。在管道、重定向、无终端环�
 
 ## 依赖
 
-本机均已探明存在：
+启动时会逐一 `shutil.which` 确认，任一缺失立即报错退出，不静默兜底。
 
 | 组件 | 用途 |
 |---|---|
 | `xelatex` | 编译（XeTeX，支持 fontspec/xeCJK） |
 | `gs` (Ghostscript) | 算内容 bounding box、裁剪 |
 | `pdftocairo` (Poppler) | PDF → 透明 PNG |
-| `magick` (ImageMagick) | 合成背景色、编码 sixel |
+| `pdftotext` (Poppler) | 提取字符级边界（防止裁掉字形） |
+| `pdfinfo` (Poppler) | 读取页面尺寸 |
+| `magick` (ImageMagick) | 合成背景色、超采样缩放、读取像素 |
+| `icat` | 把最终图片按 sixel 协议输出到终端（默认路径必需） |
 | LaTeX 宏包 | `ctex`, `amsmath`, `amssymb`, `xcolor`, `unicode-math`, `graphicx`, `geometry` |
-
-启动时会逐一 `shutil.which` 确认，任一缺失立即报错退出，不静默兜底。
 
 ---
 
@@ -343,7 +344,7 @@ sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
 | 现象 | 处理 |
 |---|---|
 | 输出偏宽/偏窄 | 调整 `-W`（字符格像素宽），或 `-v` 查看探测到的列数 |
-| 中文显示为方块 | 换 `-C` 指定本机存在的中文字体 |
+| 中文显示为方块 | 换 `-C` 指定一个本机确实存在的中文字体（`fc-list :lang=zh family` 可查） |
 | 编译失败 | `-K` 保留工作目录，查看 `xelatex.log` |
 | 输出一片空白 | 确认终端支持 sixel；`-k out.png` 导出 PNG 验证内容本身是否正常 |
 
