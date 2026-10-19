@@ -1,0 +1,1226 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sixeltex — 渲染 LaTeX / 中文 / 数学表达式为 sixel 终端图形
+
+与 sixelmath 的区别：
+  * sixelmath 用纯 Python 的 ziamath 渲染，不认识中文，只接受裸数学表达式
+  * sixeltex 走真正的 xelatex，支持中文 + 完整 LaTeX 数学，背景透明
+
+输入模式（自动判定，看第一个命令是不是 \\documentclass）：
+  表达式模式   输入被包进模板的 \\begin{document} ... \\end{document} 之间
+  完整文件模式 输入本身就是合法 .tex，直接交给 xelatex 编译
+
+依赖（本机均已探明存在）：
+  xelatex (XeTeX 3.141592653) / gs (GPL Ghostscript) / pdftocairo / magick (ImageMagick)
+  LaTeX 宏包：ctex, amsmath, amssymb, xcolor, unicode-math
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+__version__ = "1.0"
+
+# ---------------------------------------------------------------------------
+# 1. 模板表 —— 唯一的"完整环境"定义处，所有参数都只改这里的字段
+# ---------------------------------------------------------------------------
+# 用 {} 占位符；渲染时 str.format(**fields) 展开。
+# 约定：
+#   preamble_extra  —— 放 \\usepackage 等，需自行处理换行
+#   body            —— 用户输入
+TEMPLATE = r"""\documentclass[UTF8,fontset=none,{class_opts}]{{{doc_class}}}
+\usepackage{{amsmath}}
+\usepackage{{amssymb}}
+\usepackage{{xcolor}}
+\usepackage{{unicode-math}}
+\usepackage{{graphicx}}
+\usepackage[margin=0pt,paperwidth={paper_w},paperheight={paper_h}]{{geometry}}
+{extra_packages}
+{preamble_extra}
+\pagestyle{{empty}}
+{font_setup}
+{color_setup}
+\begin{{document}}
+{width_setup}
+{body}
+\end{{document}}
+"""
+
+# 模板表的默认字段值。命令行参数只覆盖其中的键。
+# 固定宏包 amsmath/amssymb/xcolor/unicode-math 已写死在 TEMPLATE 里，
+# extra_packages 用来放使用者追加的宏包（形如 \usepackage{...} 的多行文本）。
+DEFAULTS = {
+    # 文档类：ctexart / ctexrep / ctexbook / article / beamer
+    "doc_class": "ctexart",
+    # 文档类附加选项（如字号）。空串时由 render() 按 --size 生成
+    "class_opts": "",
+    # 画布尺寸(pt)。默认给足大的画布，再由 gs 按内容边界裁掉空白
+    "paper_w": "1000pt",
+    "paper_h": "1000pt",
+    # 额外宏包行，默认空
+    "extra_packages": "",
+    # 额外 preamble 内容，默认空
+    "preamble_extra": "",
+    # 字体设置（CJK + 数学）。空串时由 build_font_setup() 自动挑选本机可用字体
+    "font_setup": "",
+    # 颜色设置。空串时由 build_color_setup() 生成
+    "color_setup": "",
+    # 宽度设置。空串时由 build_width_setup() 按终端列数生成
+    "width_setup": "",
+    # 正文
+    "body": "",
+}
+
+# 颜色默认值。注意：sixel 不支持 alpha，所谓"透明背景"是把 LaTeX 透明渲染的
+# 结果合成到终端实际背景色上。这里给深色终端风格的兜底值。
+DEFAULT_FG = "#fcfcfc"
+DEFAULT_BG = "#232627"
+
+# ---------------------------------------------------------------------------
+# 2.5 终端几何探测 —— 宽度（字符数）、字号（pt）、DPI
+# ---------------------------------------------------------------------------
+# 字号探测原理：
+#   向终端发 CSI 14 t（查询文本区像素尺寸）和 CSI 18 t（查询文本区字符尺寸），
+#   两者相除得到"字符格高度(像素)"，再按本机 DPI 折算成 pt：
+#       字号(pt) = 字符格高(px) / DPI * 72
+#   任一环节拿不到就回退，最终回退 FALLBACK_FONTSIZE_PT（10pt）。
+FALLBACK_FONTSIZE_PT = 10.0
+
+# 本机探明的 DPI（~/.Xresources 的 Xft.dpi = 96）。
+# 这是"默认值不可信"原则下的显式实测值；探测失败时用它折算。
+PROBED_DPI = 96.0
+
+# 宽度回退：shutil.get_terminal_size() 拿不到时用 80 列
+FALLBACK_COLUMNS = 80
+
+# 探测到的字符格宽度(px)，宽度自适应用；None 表示未探测到
+_CELL_W_PX: float | None = None
+
+
+def _read_dpi() -> float:
+    """
+    读取本机 DPI。顺序：$SIXELTEX_DPI -> Xft.dpi(xrdb) -> 96。
+    只读操作，失败不影响主流程。
+    """
+    env = os.environ.get("SIXELTEX_DPI")
+    if env:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    try:
+        r = subprocess.run(["xrdb", "-query"], capture_output=True,
+                           text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].lower() == "xft.dpi":
+                try:
+                    v = float(parts[1])
+                    if v > 0:
+                        return v
+                except ValueError:
+                    pass
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return PROBED_DPI
+
+
+def _osc_geometry_query(timeout: float = 0.4) -> tuple[int, int, int, int] | None:
+    """
+    向终端查询文本区尺寸。返回 (像素高, 像素宽, 字符行, 字符列)，失败返回 None。
+
+    CSI 14 t -> 终端回复 CSI 4 ; 高 ; 宽 t
+    CSI 18 t -> 终端回复 CSI 8 ; 行 ; 列 t
+    只在真实 TTY 下发；非 TTY 直接放弃（不阻塞、不报错）。
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    import select
+    import termios
+    import tty
+    try:
+        fd = sys.stdin.fileno()
+        orig = termios.tcgetattr(fd)
+    except (termios.error, OSError, ValueError):
+        return None
+    try:
+        tty.setcbreak(fd)
+        px_h = px_w = ch_h = ch_w = None
+        # 一次发两个查询，然后分别读两类响应
+        sys.stdout.write("\x1b[14t\x1b[18t")
+        sys.stdout.flush()
+        deadline = _monotonic() + timeout
+        buf = b""
+        while _monotonic() < deadline:
+            if px_h is not None and ch_h is not None:
+                break
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if not r:
+                continue
+            ch = os.read(fd, 4096)
+            if not ch:
+                break
+            buf += ch
+            # CSI 4 ; 高 ; 宽 t
+            for m in re.finditer(rb"\x1b\[4;(\d+);(\d+)t", buf):
+                px_h, px_w = int(m.group(1)), int(m.group(2))
+            # CSI 8 ; 行 ; 列 t
+            for m in re.finditer(rb"\x1b\[8;(\d+);(\d+)t", buf):
+                ch_h, ch_w = int(m.group(1)), int(m.group(2))
+        if px_h and px_w and ch_h and ch_w:
+            return px_h, px_w, ch_h, ch_w
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, orig)
+        except (termios.error, OSError, ValueError):
+            pass
+
+
+def _monotonic() -> float:
+    import time
+    return time.monotonic()
+
+
+def detect_fontsize_pt(verbose: bool = False) -> float:
+    """
+    探测终端字号(pt)。失败一律回退 FALLBACK_FONTSIZE_PT(10)。
+
+    链路：CSI 14t/18t 算字符格高 -> /DPI*72 得 pt。
+    同时把探测到的字符格宽度(px)存进模块级变量，供宽度自适应使用。
+    """
+    geo = _osc_geometry_query()
+    if geo is None:
+        return FALLBACK_FONTSIZE_PT
+    px_h, px_w, ch_h, ch_w = geo
+    if not ch_h or not ch_w or not px_h or not px_w:
+        return FALLBACK_FONTSIZE_PT
+    cell_h = px_h / ch_h
+    cell_w = px_w / ch_w
+    dpi = _read_dpi()
+    pt = cell_h / dpi * 72.0
+    # 记录字符格宽度(px)，宽度自适应要用
+    global _CELL_W_PX
+    _CELL_W_PX = cell_w
+    if verbose:
+        sys.stderr.write(
+            "sixeltex: 终端 %dx%d 字符, %dx%d 像素, 字符格 %.1fx%.1fpx, "
+            "DPI %g -> 字号 %.2fpt\n"
+            % (ch_w, ch_h, px_w, px_h, cell_w, cell_h, dpi, pt))
+    # 明显离谱的值（<6pt 或 >40pt）视为探测失败
+    if pt < 6.0 or pt > 40.0:
+        return FALLBACK_FONTSIZE_PT
+    return pt
+
+
+def detect_terminal_columns() -> int:
+    r"""
+    探测终端"一行能显示多少个字符格"（列数）。失败回退 FALLBACK_COLUMNS。
+
+    探测顺序（先精确后兜底）：
+      1. os.get_terminal_size() —— 直接对 stdout/stderr/stdin 做 ioctl
+         （已在真 TTY 下实测：pty 设为 60/120/200 列都能精确读到）
+      2. shutil.get_terminal_size() —— 内部同样按 fd 尝试，并回退 $COLUMNS
+      3. $COLUMNS —— 部分 shell 会导出
+      4. FALLBACK_COLUMNS(80) —— 全部失败时
+
+    返回的是"列数"而非像素。中文占 2 列、西文占 1 列，
+    所以一列恰好是"半个中文字"的宽度，这正是排版限制宽度的单位。
+    """
+    for fh in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            cols = os.get_terminal_size(fh.fileno()).columns
+            if cols > 0:
+                return cols
+        except (OSError, ValueError, AttributeError):
+            continue
+    try:
+        cols = shutil.get_terminal_size().columns
+        if cols > 0:
+            return cols
+    except Exception:
+        pass
+    try:
+        cols = int(os.environ.get("COLUMNS", "0"))
+        if cols > 0:
+            return cols
+    except (TypeError, ValueError):
+        pass
+    return FALLBACK_COLUMNS
+
+
+# 探明的本机中文字体候选（按优先级）。只在使用者未指定字体时用于自动挑选。
+# 已实测：这三个名字 fontspec 都能直接引用，零缺字。
+FONT_CANDIDATES_CJK = [
+    "Noto Serif CJK SC",
+    "Noto Sans CJK SC",
+    "Sarasa Term SC Nerd Font",
+    "AR PL UMing CN",
+]
+FONT_CANDIDATES_LATIN = [
+    "Latin Modern Roman",
+    "Noto Serif",
+    "Liberation Serif",
+]
+# 本机探明的数学字体（fc-list 实测只有这一个带 MATH 表的可用字体）
+FONT_CANDIDATES_MATH = [
+    "Noto Sans Math",
+]
+
+# 探明的可用命令（本机已逐一 command -v 确认）
+XELATEX = "xelatex"
+GS = "gs"
+PDFTOCAIRO = "pdftocairo"
+MAGICK = "magick"
+
+
+# ---------------------------------------------------------------------------
+# 2. 依赖探测 —— 全部显式确认，缺失即报错退出，不静默兜底
+# ---------------------------------------------------------------------------
+def check_dependencies() -> None:
+    """确认外部命令都在。任一缺失立即报错并说明缺什么。"""
+    missing = []
+    for name, path in [
+        ("xelatex", XELATEX),
+        ("ghostscript (gs)", GS),
+        ("pdftocairo", PDFTOCAIRO),
+        ("ImageMagick (magick)", MAGICK),
+    ]:
+        resolved = shutil.which(path)
+        if resolved is None:
+            missing.append(name)
+        else:
+            # 把探到的真实路径写回常量，后续一律用绝对路径调用
+            globals()[_const_name(path)] = resolved
+    if missing:
+        sys.stderr.write("sixeltex: 缺少依赖: " + ", ".join(missing) + "\n")
+        sys.stderr.write("  请先安装后重试。\n")
+        sys.exit(127)
+
+
+def _const_name(path: str) -> str:
+    return {"xelatex": "XELATEX", "gs": "GS", "pdftocairo": "PDFTOCAIRO",
+            "magick": "MAGICK"}[path]
+
+
+# ---------------------------------------------------------------------------
+# 3. 终端颜色探测（OSC 10/11），继承 sixelmath 的三级回退思路
+# ---------------------------------------------------------------------------
+def _osc_query(ps: int) -> str | None:
+    """向终端查询默认前景(10)/背景(11)色。非 TTY 或超时返回 None。"""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    import select
+    import termios
+    import tty
+    try:
+        fd = sys.stdin.fileno()
+        orig = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            sys.stdout.write("\x1b]{};?\x1b\\".format(ps))
+            sys.stdout.flush()
+            buf = b""
+            # 最多等 300ms，终端不响应就放弃（sixelmath 在此处会永久阻塞）
+            while True:
+                r, _, _ = select.select([fd], [], [], 0.3)
+                if not r:
+                    return None
+                ch = os.read(fd, 1)
+                if not ch:
+                    return None
+                buf += ch
+                if buf.endswith((b"\x1b\\", b"\x07")):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, orig)
+    except Exception:
+        return None
+    s = buf.decode("utf-8", "replace")
+    m = re.fullmatch(r"\x1B\]" + str(ps) + r";(.+)(?:\x1B\\|\x07)", s)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _osc_to_hex(color: str) -> str | None:
+    """rgb:RR/GG/BB -> #RRGGBB。用正则而非固定下标切片（sixelmath 的隐患）。"""
+    m = re.fullmatch(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", color)
+    if not m:
+        return None
+    parts = []
+    for g in m.groups():
+        # 终端可能返回 4 位(16bit)或 2 位(8bit)分量，统一缩放到 8 位
+        if len(g) <= 2:
+            parts.append(g.rjust(2, "0"))
+        elif len(g) == 4:
+            parts.append(g[:2])
+        else:
+            parts.append(g[:2].ljust(2, "0"))
+    return "#" + "".join(p.lower() for p in parts)
+
+
+def detect_fg() -> str:
+    """前景色：命令行 > OSC 探测 > $SIXELTEX_FG > 默认值"""
+    v = _osc_query(10)
+    if v:
+        h = _osc_to_hex(v)
+        if h:
+            return h
+    env = os.environ.get("SIXELTEX_FG")
+    if env:
+        return env
+    return DEFAULT_FG
+
+
+def detect_bg() -> str:
+    """背景色：命令行 > OSC 探测 > $SIXELTEX_BG > 默认值"""
+    v = _osc_query(11)
+    if v:
+        h = _osc_to_hex(v)
+        if h:
+            return h
+    env = os.environ.get("SIXELTEX_BG")
+    if env:
+        return env
+    return DEFAULT_BG
+
+
+# ---------------------------------------------------------------------------
+# 4. 字体与颜色字段生成
+# ---------------------------------------------------------------------------
+# 终端字符格的像素宽度。Sixel 图在终端里按像素渲染，
+# 所以"图片像素宽 / cell_w = 占用的列数"。
+# 8px 是多数终端在 100% 缩放下的等宽字符格宽（16px 字号等宽字体的半宽）。
+# 实测不准时用 -W 覆盖。
+DEFAULT_CELL_W_PX = 8.0
+
+
+def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
+    r"""
+    反算 DPI，使"按列数限宽排版"的内容恰好占满 columns 列。
+
+    推导：
+      LaTeX 里可用文本宽 = (columns/2) 个中文字宽，1 个中文字宽 = 1em = fontsize_pt。
+      所以内容宽 = (columns/2) * fontsize_pt  (单位 pt)
+      该内容渲染成像素宽 = 内容宽 * DPI / 72
+      要让它在终端占 columns 列，需 像素宽 = columns * cell_w_px
+      联立：
+          (columns/2) * fontsize_pt * DPI / 72 = columns * cell_w_px
+          => DPI = 2 * cell_w_px * 72 / fontsize_pt
+      注意 columns 被约掉了——DPI 只取决于 cell_w 和字号，
+      与终端列数无关。这正是之前固定 DPI=200 导致超宽近一倍的原因：
+      80 列内容本该占 640px，200 DPI 下却渲染成 1103px（约 138 列）。
+    """
+    if fontsize_pt <= 0 or cell_w_px <= 0:
+        return 72.0
+    return 2.0 * cell_w_px * 72.0 / fontsize_pt
+
+
+def build_width_setup(columns: int, enabled: bool = True) -> tuple[str, str]:
+    r"""
+    按"终端一行能显示多少列"生成宽度限制，返回 (width_setup, body_prefix)。
+
+    为什么不做事后缩图：缩图会让字变小、变糊，而且判据要猜终端字符格像素宽。
+    正确做法是让 LaTeX 在排版阶段就知道可用宽度，自己换行。
+
+    宽度换算：
+      终端一列 = 半个中文字宽（西文 1 列、中文 2 列）。
+      所以可用文本宽 = columns / 2 个中文字宽：
+          \setbox0=\hbox{中}\width = columns/2 * \wd0
+      再用 \parbox{\width}{...} 包住正文，超长内容自动折行。
+
+    enabled=False 或 columns<=0 时返回空串，表示不限制宽度。
+    """
+    if not enabled or columns is None or columns <= 0:
+        return "", ""
+    halfwidth_units = columns / 2.0
+    setup = (
+        r"\newdimen\SixeltexWidth"
+        "\n"
+        r"\setbox0=\hbox{中}"
+        "\n"
+        r"\SixeltexWidth=%.4f\wd0" % halfwidth_units
+    )
+    prefix = r"\parbox{\SixeltexWidth}{\raggedright " 
+    return setup, prefix
+
+
+def wrap_body_for_width(body: str, width_setup: str) -> str:
+    r"""
+    用 \parbox 包住正文以限制宽度。
+    只对"含文本"的内容包裹：纯行间公式（\[...\]）本身宽度由公式决定，
+    包 parbox 反而可能破坏行间公式排版，故不包。
+    """
+    if not width_setup:
+        return body
+    stripped = body.strip()
+    # 纯行间公式 / 纯数学环境：不包（其宽度天然由内容决定）
+    if stripped.startswith("\\[") or stripped.startswith("\\begin{equation"):
+        return body
+    return r"\parbox{\SixeltexWidth}{\raggedright " + stripped + "}"
+
+
+def _size_to_class_opt(size: float) -> str:
+    """
+    把任意 pt 字号映射到文档类选项。
+
+    LaTeX 标准文档类只接受离散档位 10pt/11pt/12pt，写任意数值会报
+    "Unused global option"。这里显式归到最接近的档位，并如实告知用户
+    实际生效的值（不静默偏离用户输入）。
+    """
+    if size is None:
+        return ""
+    opts = [(10.0, "10pt"), (11.0, "11pt"), (12.0, "12pt")]
+    best = min(opts, key=lambda o: abs(o[0] - size))
+    return best[1]
+
+
+def build_font_setup(fields: dict) -> str:
+    """按模板字段生成 fontspec/xeCJK 设置。"""
+    cjk = fields.get("cjk_font")
+    latin = fields.get("latin_font")
+    math = fields.get("math_font")
+    if not cjk:
+        cjk = FONT_CANDIDATES_CJK[0]
+    lines = []
+    if latin:
+        lines.append(r"\setmainfont{%s}" % latin)
+    if cjk:
+        lines.append(r"\setCJKmainfont{%s}" % cjk)
+    if math:
+        lines.append(r"\setmathfont{%s}" % math)
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def _hex_to_tex(color: str) -> tuple[str, str] | None:
+    """
+    '#RRGGBB' -> ('FCFCFC', None)（可直接喂给 xcolor 的 HTML 模型）
+    命名色   -> (None, 'white')
+    返回 (hex_without_hash, named)；都None表示无法解析。
+    """
+    c = color.strip()
+    # 容错：用户可能把 shell 引号一起传进来，如 "'#ff8800'"
+    if len(c) >= 2 and c[0] == c[-1] and c[0] in "'\"":
+        c = c[1:-1].strip()
+    if c.startswith("#"):
+        body = c[1:]
+        if len(body) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in body):
+            return body.upper(), None
+        if len(body) == 3 and all(ch in "0123456789abcdefABCDEF" for ch in body):
+            return "".join(ch * 2 for ch in body).upper(), None
+        return None
+    # 命名色交给 xcolor 自己判断；只接受安全字符，避免注入
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", c):
+        return None, c
+    return None
+
+
+def build_color_setup(fields: dict, fg: str, bg: str) -> str:
+    """
+    透明背景实现：
+      LaTeX 侧只设前景色、不设页面背景（保持透明）
+      PNG 侧用 pdftocairo -transp 得带 alpha 的透明图
+      最后合成到探测到的终端背景色上 —— 视觉即"透明"
+
+    注意：不能把 '#RRGGBB' 直接写进 \\color{}——'#' 在 LaTeX 里是宏参数标记，
+    会报 "Illegal parameter number in definition of \\XC@@tmp"。
+    必须先 \\definecolor 定义成颜色名再引用。
+    """
+    parsed = _hex_to_tex(fg)
+    if parsed is None:
+        sys.stderr.write("sixeltex: 无法解析前景色 %r，改用默认 %s\n"
+                         % (fg, DEFAULT_FG))
+        fg = DEFAULT_FG
+        parsed = _hex_to_tex(fg)
+    hexval, named = parsed
+    lines = []
+    if hexval:
+        lines.append(r"\definecolor{sixeltexfg}{HTML}{%s}" % hexval)
+        lines.append(r"\color{sixeltexfg}")
+    else:
+        lines.append(r"\color{%s}" % named)
+    extra = fields.get("color_extra")
+    if extra:
+        lines.append(extra)
+    # 抑制正文首行缩进：单行/公式输出不需要段落缩进
+    lines.append(r"\setlength{\parindent}{0pt}")
+    lines.append(r"\setlength{\parskip}{0pt}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 5. 输入模式判定
+# ---------------------------------------------------------------------------
+def is_full_document(text: str) -> bool:
+    """
+    看第一个命令是不是 \\documentclass。
+    找到 \\documentclass 即判定为完整文件模式；否则表达式模式。
+    判定依据只看"是否出现"，不做更激进的猜测。
+    """
+    return re.search(r"\\documentclass", text) is not None
+
+
+def _looks_like_prose(text: str) -> bool:
+    """
+    判断输入是否"像散文/混排文本"而不是"纯数学"。
+    含中日韩字符，或含大量非数学类西文单词时，认为是正文，
+    不再强行套 \\[ ... \\] / align* —— 否则内嵌的 $...$ 会和外层
+    定界符冲突（"Display math should end with $$"）。
+    """
+    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+        return True
+    return False
+
+
+def _scale_inline(text: str, scale: float | None) -> str:
+    r"""对纯数学文本套 \scalebox{factor}{$...$} 实现连续字号缩放。
+
+    注意套裹层级：\scalebox 的参数必须是 $...$ 行内公式，
+    不能是 \[ ... \] 行间公式（后者在 hbox 内会报
+    "Missing $ inserted"，已实测）。因此缩放在包定界符之前做。
+
+    scale 为 None/1.0 时原样返回。
+    含中日韩文字时不缩放（汉字会被撕伸变形）。
+    """
+    if not scale or scale == 1.0:
+        return text
+    if _looks_like_prose(text):
+        return text
+    return r"\scalebox{%s}{$\displaystyle %s$}" % (scale, text)
+
+
+def _has_math_env(text: str) -> bool:
+    """
+    检测输入是否自带了"数学类"环境。
+    这些环境必须处于数学模式内，直接放进正文会报
+    "Missing $ inserted"（如 \begin{pmatrix}）。
+    """
+    math_envs = (
+        "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix",
+        "smallmatrix", "array", "cases", "dcases", "rcases", "aligned",
+        "gathered", "split", "multline", "equation", "align", "gather",
+        "flalign", "eqnarray", "subequations",
+    )
+    for env in math_envs:
+        if re.search(r"\\begin\{" + env + r"\*?\}", text):
+            return True
+    return False
+
+
+def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
+    """
+    表达式模式：把输入包进合适的环境。
+    用户可用 -e/--env 强制指定环境。默认按内容自动选择：
+      含 \\begin{...} 已自带环境 -> 原样放入
+      含中日韩文字/正文文本       -> 原样作为正文段落（保留其中的 $...$）
+      含换行或多个公式            -> align*
+      其余（纯数学）              -> \\[ ... \\] 行间公式
+
+    纯数学输入会先剥掉外层一对 $ 或 \\( \\)，避免 \\[$...$\\] 这类
+    定界符嵌套冲突（"Display math should end with $$"）。
+    """
+    text = text.strip()
+    # 剥掉外层 $...$（整段被一对 $ 包裹时才剥，避免误伤 $a$$b$ 之类）
+    if len(text) >= 2 and text.startswith("$") and text.endswith("$") \
+            and not text.startswith("$$") and not text.endswith("$$"):
+        inner = text[1:-1]
+        if "$" not in inner:
+            text = inner.strip()
+    # 剥掉外层 \( ... \)
+    if text.startswith("\\(") and text.endswith("\\)"):
+        inner = text[2:-2]
+        if "\\(" not in inner and "\\)" not in inner:
+            text = inner.strip()
+
+    env = fields.get("math_env")
+    if env:
+        return "\\begin{%s}\n%s\n\\end{%s}" % (env, text, env)
+    # 正文/混排优先判定：含中文的内容本就是段落文本，
+    # 即使内部有 pmatrix 之类的数学环境，也应当由它自己的 $...$
+    # 定界符包住，不能在外层再套 \\[...\\]（否则与内层 $
+    # 冲突，报 "Display math should end with $$"）。
+    if _looks_like_prose(text):
+        return text
+    if _has_math_env(text):
+        # 纯数学环境（无中文）本身就在数学模式内，只需外面套行间定界符
+        return "\\[\n%s\n\\]" % text
+    if re.search(r"\\begin\{", text):
+        # 其它环境（如 itemize/tabular）本就属文本模式，尊重原样
+        return text
+    if "\n" in text or re.search(r"\\\\", text):
+        inner = _scale_inline(text, scale)
+        return "\\begin{align*}\n%s\n\\end{align*}" % inner
+    inner = _scale_inline(text, scale)
+    return "\\[\n%s\n\\]" % inner
+
+
+# ---------------------------------------------------------------------------
+# 6. 编译与渲染管线
+# ---------------------------------------------------------------------------
+def compile_tex(tex: str, workdir: str) -> str:
+    """跑 xelatex，返回生成的 pdf 路径。失败则打印日志尾部并退出。"""
+    src = os.path.join(workdir, "sixeltex.tex")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(tex)
+    logfile = os.path.join(workdir, "xelatex.log")
+    with open(logfile, "w", encoding="utf-8") as lf:
+        proc = subprocess.run(
+            [XELATEX, "-interaction=nonstopmode", "-halt-on-error",
+             "-no-shell-escape", "-output-directory", workdir,
+             "sixeltex.tex"],
+            stdout=lf, stderr=subprocess.STDOUT, cwd=workdir,
+            timeout=600,
+        )
+    pdf = os.path.join(workdir, "sixeltex.pdf")
+    if proc.returncode != 0 or not os.path.exists(pdf):
+        sys.stderr.write("sixeltex: xelatex 编译失败。日志尾部：\n")
+        with open(logfile, encoding="utf-8", errors="replace") as lf:
+            sys.stderr.write(lf.read()[-4000:])
+        sys.stderr.write("\n提示：用 -k 保留工作目录可查看完整 .tex 与 .log\n")
+        sys.exit(1)
+    # 顺带报告缺字（不影响退出码，但用户需要知道中文是否渲染出来了）
+    with open(logfile, encoding="utf-8", errors="replace") as lf:
+        missing = sum(1 for line in lf if "Missing character" in line)
+    if missing:
+        sys.stderr.write("sixeltex: 警告：检测到 %d 个缺字，"
+                         "请检查字体设置（-C / -M）\n" % missing)
+    return pdf
+
+
+def _bbox_from_pdftotext(pdf: str) -> tuple[float, float, float, float] | None:
+    r"""
+    用 pdftotext -bbox 取所有字符的精确边界（PDF 坐标系，原点左上）。
+
+    gs 的 bbox 设备对上下标、\left(...\right)、积分号伸出的部分判断偏紧，
+    会裁掉字形（实测：含 $x_1$ $x^2$ 的文本，gs 给 11.9pt 高，
+    而 pdftotext 的字符边界是 14.3pt 高）。所以以字符边界为准。
+
+    返回 (x0, y0_top, x1, y1_top)；失败返回 None。
+    """
+    proc = subprocess.run(["pdftotext", "-bbox", pdf, "-"],
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    xs0 = []
+    ys0 = []
+    xs1 = []
+    ys1 = []
+    page_h = None
+    for m in re.finditer(r'<page\s+width="([\d.]+)"\s+height="([\d.]+)"', proc.stdout):
+        page_h = float(m.group(2))
+        break
+    for m in re.finditer(
+            r'xMin="([\d.-]+)"\s+yMin="([\d.-]+)"\s+xMax="([\d.-]+)"\s+yMax="([\d.-]+)"',
+            proc.stdout):
+        x0, y0, x1, y1 = (float(g) for g in m.groups())
+        xs0.append(x0); ys0.append(y0); xs1.append(x1); ys1.append(y1)
+    if not xs0 or page_h is None:
+        return None
+    return min(xs0), min(ys0), max(xs1), max(ys1)
+
+
+def crop_pdf(pdf: str, workdir: str, pad_pt: float = 1.0,
+             keep_width: bool = True) -> str:
+    r"""
+    计算内容边界后写进 CropBox，得到紧凑页面。
+
+    边界来源（取并集，宁可多留也不裁字）：
+      1. pdftotext -bbox 的字符级边界 —— 覆盖上下标、积分号等
+      2. ghostscript 的 HiResBoundingBox —— 覆盖纯图形（tikz 线条等无字符内容）
+
+    再四周各留 pad_pt(pt) 安全边距，避免抗锯齿边缘被切。
+
+    keep_width=True 时左右不裁剪，保留整页宽度（页面宽度本身已按终端列数
+    设定），只裁剪上下。左右裁紧会在两端切掉字形边缘或间距，故默认保留。
+
+    为何不用 preview 包：ctexart 下 preview 只裁到第一个公式，
+    多行/混排内容会整段丢失（已实测）。
+    """
+    boxes = []
+
+    # 1) 字符级边界（转成 PDF 坐标：左下原点）
+    tb = _bbox_from_pdftotext(pdf)
+    if tb is not None:
+        tx0, ty0_top, tx1, ty1_top = tb
+        # 取页面高度换算
+        info = subprocess.run(["pdfinfo", pdf], capture_output=True, text=True,
+                              timeout=120)
+        # 注意："Page size:  595.28 x 841.89 pts (A4)" 拆开后
+        #   ['Page','size:','595.28','x','841.89','pts','(A4)']
+        # 高度在索引 4，索引 2 是宽度。曾因此把宽度当成高度，
+        # 导致 CropBox 的 y 坐标错位、图片下方留白。
+        page_h = 0.0
+        for line in info.stdout.splitlines():
+            if line.lower().startswith("page size:"):
+                nums = re.findall(r"[\d.]+", line)
+                try:
+                    page_h = float(nums[1])
+                except (IndexError, ValueError):
+                    page_h = 0.0
+                break
+        if page_h > 0:
+            boxes.append((tx0, page_h - ty1_top, tx1, page_h - ty0_top))
+        else:
+            boxes.append((tx0, -ty1_top, tx1, -ty0_top))
+
+    # 2) gs 的矢量边界
+    proc = subprocess.run(
+        [GS, "-dNOPAUSE", "-dBATCH", "-sDEVICE=bbox", pdf],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300,
+    )
+    err = proc.stderr.decode("utf-8", "replace")
+    m = re.search(r"%%HiResBoundingBox:\s*([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)",
+                  err)
+    if m:
+        boxes.append(tuple(float(g) for g in m.groups()))
+
+    if not boxes:
+        sys.stderr.write("sixeltex: 无法获取内容边界，按整页渲染\n")
+        return pdf
+
+    x0 = min(b[0] for b in boxes)
+    y0 = min(b[1] for b in boxes)
+    x1 = max(b[2] for b in boxes)
+    y1 = max(b[3] for b in boxes)
+
+    # 安全边距，并夹到页面内
+    info = subprocess.run(["pdfinfo", pdf], capture_output=True, text=True,
+                          timeout=120)
+    page_w = page_h2 = 0.0
+    for line in info.stdout.splitlines():
+        if line.lower().startswith("page size:"):
+            try:
+                parts = line.split()
+                page_w = float(parts[2])
+                page_h2 = float(parts[4])
+            except (IndexError, ValueError):
+                pass
+            break
+    y0 = max(0.0, y0 - pad_pt)
+    if keep_width and page_w > 0:
+        # 左右不裁：直接取整页宽度
+        x0 = 0.0
+        x1 = page_w
+    else:
+        x0 = max(0.0, x0 - pad_pt)
+        if page_w > 0:
+            x1 = min(page_w, x1 + pad_pt)
+        else:
+            x1 = x1 + pad_pt
+    if page_h2 > 0:
+        y1 = min(page_h2, y1 + pad_pt)
+    else:
+        y1 = y1 + pad_pt
+
+    out = os.path.join(workdir, "sixeltex-cropped.pdf")
+    subprocess.run(
+        [GS, "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", "-o", out,
+         "-c", "[ /CropBox [%.4f %.4f %.4f %.4f] /PAGES pdfmark" % (x0, y0, x1, y1),
+         "-f", pdf],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=300, cwd=workdir,
+    )
+    return out if os.path.exists(out) else pdf
+
+
+def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
+    """pdftocairo -transp 得到带 alpha 的透明 PNG。"""
+    prefix = os.path.join(workdir, "sixeltex")
+    subprocess.run(
+        [PDFTOCAIRO, "-png", "-r", str(dpi), "-singlefile",
+         "-cropbox", "-transp", pdf, prefix],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        timeout=300, check=True,
+    )
+    png = prefix + ".png"
+    if not os.path.exists(png):
+        raise RuntimeError("pdftocairo 未生成 PNG")
+    return png
+
+
+def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
+    """把透明 PNG 合成到终端背景色上，并按需四周加留白像素。"""
+    cmd = [MAGICK, png]
+    if margin and margin > 0:
+        cmd += ["-bordercolor", "transparent", "-border", str(margin)]
+    cmd += ["-background", bg, "-alpha", "remove", "-alpha", "off", out]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=300, check=True)
+    return out
+
+
+def _image_size(png: str) -> tuple[int, int]:
+    out = subprocess.run([MAGICK, png, "-format", "%w %h", "info:"],
+                         capture_output=True, text=True, timeout=120)
+    w, h = out.stdout.split()
+    return int(w), int(h)
+
+
+def encode_transparent_sixel(png: str, fg: str) -> bytes:
+    """
+    透传 sixel 编码器：只编码 alpha>0 的字形像素，背景像素不写色。
+
+    这样终端的原有背景/内容能透出来，实现"背景完全透明"
+    （sixel 协议本身无 alpha 通道，只能用"不写背景色"达到透传效果）。
+
+    为什么不用 ImageMagick 的 sixel coder：它无法表达"背景不写色"，
+    会把透明区合成成某个不透明色。libsixel 的 img2sixel 在本机输出恒为
+    0 字节（已实测），故自写编码器。
+    本编码器输出已用 libsixel 自带的 sixel2png 反向解码验证通过。
+    """
+    # 取 RGBA 原始像素
+    proc = subprocess.run([MAGICK, png, "-depth", "8", "rgba:-"],
+                          capture_output=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError("读取 PNG 像素失败")
+    data = proc.stdout
+    w, h = _image_size(png)
+    if len(data) != w * h * 4:
+        raise RuntimeError("像素数据长度不符: %d != %d" % (len(data), w * h * 4))
+
+    # 前景色 -> RGB(0-100)，sixel 用百分比表示
+    # 支持三种输入：'#RRGGBB' / '#RGB' / 命名色（如 'red'）
+    # 注意：'#RGB' 的 3 位缩写展开只对带 # 的十六进制生效，
+    # 否则 'red' 这类命名色会被误当成缩写展开成 'rreedd'。
+    orig = fg
+    # 容错：剥掉可能一并传入的 shell 引号
+    fg = fg.strip()
+    if len(fg) >= 2 and fg[0] == fg[-1] and fg[0] in "'\"":
+        fg = fg[1:-1].strip()
+    if fg.startswith("#"):
+        body = fg[1:]
+        if len(body) == 3 and all(c in "0123456789abcdefABCDEF" for c in body):
+            body = "".join(c * 2 for c in body)
+        if len(body) != 6 or not all(c in "0123456789abcdefABCDEF" for c in body):
+            raise RuntimeError("前景色格式错误: %r" % orig)
+        hexrgb = body
+    else:
+        # 命名色：交给 ImageMagick 解析成 RGB
+        r = subprocess.run(
+            [MAGICK, "xc:" + fg, "-format", "%[fx:int(255*r)].%[fx:int(255*g)].%[fx:int(255*b)]",
+             "info:"],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError("无法识别的颜色名: %r" % orig)
+        try:
+            rr, gg, bb = (int(x) for x in r.stdout.strip().split("."))
+        except ValueError:
+            raise RuntimeError("无法识别的颜色名: %r" % orig)
+        hexrgb = "%02x%02x%02x" % (rr, gg, bb)
+
+    try:
+        fr, fgc, fb = (int(hexrgb[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        raise RuntimeError("前景色格式错误: %r" % orig)
+    # 0-255 -> 0-100（四舍五入，避免 truncation 偏差）
+    pr = int(round(fr * 100 / 255.0))
+    pg = int(round(fgc * 100 / 255.0))
+    pb = int(round(fb * 100 / 255.0))
+
+    # alpha 阈值二值化：>32 视为字形（滤掉抗锯齿边缘的微透明）
+    mask = data[3::4]
+    glyph = [1 if a > 32 else 0 for a in mask]
+
+    out = bytearray()
+    out += b"\x1bP0;1;0q"                      # DCS + P1;P2;P3 + q
+    out += ('"1;1;%d;%d' % (w, h)).encode()    # 栅格属性
+    out += ("#1;2;%d;%d;%d" % (pr, pg, pb)).encode()  # 颜色1 = 前景
+    # 逐 6 行条带编码；每列一个字节，bit0..5 对应该列 6 个像素
+    for y0 in range(0, h, 6):
+        band = bytearray(w)
+        for x in range(w):
+            b = 0
+            base = y0 * w + x
+            for k in range(6):
+                y = y0 + k
+                if y < h and glyph[base + k * w]:
+                    b |= (1 << k)
+            band[x] = b
+        # RLE 压缩（重复 >=4 次才值得写）
+        parts = []
+        i = 0
+        while i < w:
+            j = i
+            v = band[i]
+            while j < w and band[j] == v:
+                j += 1
+            cnt = j - i
+            ch = chr(v + 63)
+            if cnt >= 4:
+                parts.append("!%d%s" % (cnt, ch))
+            else:
+                parts.append(ch * cnt)
+            i = j
+        out += b"#1" + "".join(parts).encode("ascii") + b"-"
+    out += b"\x1b\\"                            # ST
+    return bytes(out)
+
+
+def png_to_sixel_transparent(png: str, fg: str) -> None:
+    """透传模式：编码并写到 stdout。"""
+    try:
+        sixel = encode_transparent_sixel(png, fg)
+    except (RuntimeError, OSError) as e:
+        sys.stderr.write("sixeltex: sixel 编码失败: %s\n" % e)
+        sys.exit(1)
+    sys.stdout.buffer.write(sixel)
+    sys.stdout.buffer.flush()
+
+
+def png_to_sixel_opaque(png: str, colors: int) -> None:
+    """不透明模式：用 ImageMagick 的 sixel coder（已验证可正常产出）。"""
+    proc = subprocess.run(
+        [MAGICK, png, "-colorspace", "sRGB",
+         "-colors", str(colors), "-depth", "8", "sixel:-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=300,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        sys.stderr.write("sixeltex: sixel 编码失败\n")
+        sys.stderr.write(proc.stderr.decode("utf-8", "replace")[-2000:])
+        sys.exit(1)
+    sys.stdout.buffer.write(proc.stdout)
+    sys.stdout.buffer.flush()
+
+
+
+# ---------------------------------------------------------------------------
+# 7. 主流程
+# ---------------------------------------------------------------------------
+def render(text: str, args: argparse.Namespace) -> None:
+    # 组装模板字段：默认值 <- 命令行覆盖
+    fields = dict(DEFAULTS)
+    if args.doc_class:
+        fields["doc_class"] = args.doc_class
+    if args.packages:
+        # 使用者给的宏包名列表 -> \usepackage{...} 多行文本
+        fields["extra_packages"] = "\n".join(
+            "\\usepackage{%s}" % p for p in args.packages)
+    if args.preamble:
+        fields["preamble_extra"] = args.preamble
+    if args.math_env:
+        fields["math_env"] = args.math_env
+    if args.cjk_font:
+        fields["cjk_font"] = args.cjk_font
+    if args.latin_font:
+        fields["latin_font"] = args.latin_font
+    if args.math_font:
+        fields["math_font"] = args.math_font
+
+    # 颜色：命令行优先，否则探测
+    fg = args.color if args.color else detect_fg()
+    bg = args.bgcolor if args.bgcolor else detect_bg()
+
+    # 字号：命令行 > 探测终端字号 > 10pt 兜底
+    if args.size is not None:
+        fontsize = args.size
+    else:
+        fontsize = detect_fontsize_pt(args.verbose)
+    # 字号接入文档类选项。LaTeX 只认离散档位(10/11/12pt)，
+    # 任意 pt 值归到最接近的档位并如实告知。
+    fields["class_opts"] = _size_to_class_opt(fontsize)
+
+    # 终端宽度(列数)：按列数限制排版宽度，让 LaTeX 自己换行
+    columns = args.width if args.width else detect_terminal_columns()
+    width_setup, _ = build_width_setup(columns, enabled=not args.no_wrap)
+    fields["width_setup"] = width_setup
+
+    # 页面宽度 = 终端列宽（左右不裁剪的前提）。
+    # 一列 = 半个中文字宽 = fontsize/2 pt，故列数/2 * fontsize。
+    # 高度留足够大，上下再按内容裁剪。
+    if not args.no_wrap:
+        paper_w = (columns / 2.0) * fontsize
+        fields["paper_w"] = "%.3fpt" % paper_w
+        fields["paper_h"] = "%.3fpt" % max(paper_w * 4.0, 200.0)
+
+    # DPI：未显式指定时按 cell_w 和字号反算，保证内容恰好占满 columns 列。
+    # 固定 200 DPI 会让 80 列的内容渲染成约 138 列宽（超宽近一倍）。
+    if args.dpi is not None:
+        dpi = args.dpi
+    else:
+        dpi = int(round(compute_dpi_for_columns(args.cell_w, fontsize)))
+        if dpi < 36:
+            dpi = 36
+
+    fields["font_setup"] = build_font_setup(fields)
+    fields["color_setup"] = build_color_setup(fields, fg, bg)
+
+    # 输入模式判定
+    if is_full_document(text):
+        tex = text
+        mode = "完整文件"
+    else:
+        body = wrap_expression(text, fields, args.math_scale)
+        # 按终端列宽折行，避免渲染出一行超长内容
+        fields["body"] = wrap_body_for_width(body, width_setup)
+        tex = TEMPLATE.format(**fields)
+        mode = "表达式"
+
+    if args.verbose:
+        sys.stderr.write(
+            "sixeltex: 模式=%s 前景=%s 背景=%s dpi=%d 字号=%.2fpt 终端=%d列%s\n"
+            % (mode, fg, bg, dpi, fontsize, columns,
+               " 透传" if args.transparent else " 合成背景"))
+
+    if args.dry_run:
+        sys.stderr.write(tex)
+        sys.stderr.write("\n")
+        return
+
+    workdir_ctx = tempfile.mkdtemp(prefix="sixeltex-")
+    try:
+        pdf = compile_tex(tex, workdir_ctx)
+        pdf = crop_pdf(pdf, workdir_ctx, keep_width=not args.crop_width)
+        png = pdf_to_transparent_png(pdf, workdir_ctx, dpi)
+
+
+        if args.keep_png:
+            dest = os.path.abspath(args.keep_png)
+            shutil.copyfile(png, dest)
+            sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
+
+        if args.transparent:
+            # 透传模式（需显式开启）：只画字形像素，背景不写色
+            if args.margin and args.margin > 0:
+                bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
+                subprocess.run(
+                    [MAGICK, png, "-bordercolor", "transparent",
+                     "-border", str(args.margin), bordered],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=300, check=True)
+                png = bordered
+            png_to_sixel_transparent(png, fg)
+        else:
+            # 默认：把透明渲染结果合成到背景色，避免与终端背景撞色
+            final = os.path.join(workdir_ctx, "sixeltex-composited.png")
+            composite_bg(png, bg, final, args.margin)
+            png_to_sixel_opaque(final, args.colors)
+    finally:
+        if args.keep_dir:
+            sys.stderr.write("sixeltex: 工作目录保留在 %s\n" % workdir_ctx)
+        else:
+            shutil.rmtree(workdir_ctx, ignore_errors=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sixeltex",
+        description="渲染 LaTeX / 中文 / 数学表达式为 sixel 终端图形（走真实 xelatex）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例:
+  sixeltex '\\frac{1}{1+x}'                单个公式
+  sixeltex '$E=mc^2$'                      带 $ 也行，自动剥掉
+  echo 'x^2' | sixeltex                   标准输入
+  sixeltex '中文测试: $f(x)=x^2$'           中英混排
+  sixeltex doc.tex                        完整 .tex 文件(含 \\documentclass)
+  sixeltex -t beamer -C "Noto Sans CJK SC" '内容'
+
+环境变量:
+  SIXELTEX_FG / SIXELTEX_BG    指定前景/背景色(OSC 探测失败时使用)
+""")
+    p.add_argument("input", nargs="?", default=None,
+                   help="LaTeX 表达式，或完整 .tex 文件路径；省略则读标准输入")
+    p.add_argument("-s", "--size", type=float, default=None,
+                   help="正文字号(pt)。默认自动探测终端字号（CSI 14t/18t），"
+                        "探测失败回退 10pt。LaTeX 只认 10/11/12pt 档位，"
+                        "其他值归到最接近档位并提示；连续缩放用 -S")
+    p.add_argument("-d", "--dpi", type=int, default=None,
+                   help="光栅化分辨率 DPI。默认按 -W 与字号自动反算，"
+                        "使内容恰好占满终端列数；显式指定则完全由你决定")
+    p.add_argument("-W", "--cell-width", dest="cell_w", type=float,
+                   default=DEFAULT_CELL_W_PX,
+                   help="终端一个字符格的像素宽，默认 %g。"
+                        "决定输出图在终端里占多少列，不准时改它" % DEFAULT_CELL_W_PX)
+    p.add_argument("-c", "--color", default=None,
+                   help="前景色，命名色或 #RRGGBB。默认 OSC 探测终端色")
+    p.add_argument("-b", "--bgcolor", default=None,
+                   help="背景色。默认 OSC 探测；此为合到底色，非 LaTeX 页面背景")
+    p.add_argument("-m", "--margin", type=int, default=0,
+                   help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
+    p.add_argument("-S", "--math-scale", dest="math_scale", type=float,
+                   default=None,
+                   help="数学公式连续缩放倍数，如 1.5 或 0.8。默认不缩放。"
+                        "仅对纯数学生效，含中文的正文不缩放（避免字形被拉伸）")
+    p.add_argument("-p", "--colors", type=int, default=256,
+                   help="sixel 调色板颜色数，默认 256")
+    p.add_argument("-t", "--doc-class", dest="doc_class", default=None,
+                   help="文档类：ctexart(默认)/ctexrep/ctexbook/article/beamer")
+    p.add_argument("-P", "--packages", nargs="+", default=None,
+                   help="追加宏包列表（空格分隔），如 -P tikz pgfplots")
+    p.add_argument("-A", "--preamble", default=None,
+                   help="额外插入 preamble 的原文（每行一条）")
+    p.add_argument("-e", "--env", dest="math_env", default=None,
+                   help="强制指定数学环境，如 align* / equation / gather")
+    p.add_argument("-C", "--cjk-font", dest="cjk_font", default=None,
+                   help="中文字体名。默认自动探测本机可用中文字体")
+    p.add_argument("-L", "--latin-font", dest="latin_font", default=None,
+                   help="西文字体名")
+    p.add_argument("-M", "--math-font", dest="math_font", default=None,
+                   help="数学字体名（需带 MATH 表）")
+    p.add_argument("--transparent", action="store_true",
+                   help="透传背景：只画字形像素，背景不写色，让终端原样透出。"
+                        "默认是把结果合成到 -b/探测到的背景色")
+    p.add_argument("--no-wrap", action="store_true",
+                   help="关闭按终端列宽自动折行（默认按探测到的列数限制排版宽度）")
+    p.add_argument("--crop-width", action="store_true",
+                   help="左右也按内容裁剪（默认只裁上下，左右保留整页宽度）")
+    p.add_argument("-w", "--width", type=int, default=None,
+                   help="强制指定终端列数（默认自动探测，失败用 80）")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="只打印生成的 .tex 源，不编译渲染")
+    p.add_argument("-k", "--keep-png", metavar="FILE", default=None,
+                   help="把中间 PNG 另存到指定路径")
+    p.add_argument("-K", "--keep-dir", action="store_true",
+                   help="保留临时工作目录（含 .tex/.pdf/.log）便于调试")
+    p.add_argument("-v", "--verbose", action="store_true", help="打印诊断信息")
+    p.add_argument("-V", "--version", action="version",
+                   version="sixeltex " + __version__)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    check_dependencies()
+
+    # 取输入
+    if args.input is None:
+        if sys.stdin.isatty():
+            sys.stderr.write("sixeltex: 未提供输入。用法: sixeltex '表达式' "
+                             "或 sixeltex 文件.tex\n")
+            return 2
+        text = sys.stdin.read()
+    else:
+        # 先按文件读；读不到就按表达式字面量处理
+        try:
+            if os.path.isfile(args.input):
+                with open(args.input, encoding="utf-8") as f:
+                    text = f.read()
+            else:
+                text = args.input
+        except (OSError, UnicodeDecodeError):
+            text = args.input
+
+    if not text.strip():
+        sys.stderr.write("sixeltex: 输入为空\n")
+        return 2
+
+    render(text, args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

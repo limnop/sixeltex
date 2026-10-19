@@ -1,0 +1,35 @@
+# 研究工作区自带的脚手架文件，不属于项目
+AGENTS.md
+
+# 研究资料：sixelmath 拆解报告与源码副本，不属于 sixeltex 项目本体
+研究资料/
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 编辑器 / 系统临时文件
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+*.bak
+*.bak-*
+
+# sixeltex 运行产物
+# 中间 PNG 用 -k 导出时可能落在仓库里
+sixeltex-*.png
+out.png
+*.sixel
+
+# LaTeX 编译中间产物（用 -K 保留工作目录时可能出现）
+*.aux
+*.log
+*.xdv
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
