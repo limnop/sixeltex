@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 __version__ = "1.0"
 
@@ -477,6 +478,36 @@ def compute_dpi_for_cell_height(cell_h_px: float | None,
         cell_h_px = 16.0
     dpi = cell_h_px * 72.0 / fontsize_pt
     return max(36.0, min(dpi, 600.0))
+
+
+def estimate_paper_height(text: str, columns: int, fontsize: float) -> float:
+    r"""
+    估算把 text 按 columns 列宽排版需要多少页面高度(pt)。
+
+    为什么需要：页面高度若不够，LaTeX 会把内容分页，而 pdftocairo
+    用 -singlefile 只栅格化第 1 页，第 2 页起的内容会被静默丢弃
+    （实测 5760 字符中文溢出 1600pt 页面，2 页，丢失 1640 字）。
+
+    估算宁可偏高：页面高一些只是中间 PDF 变大，后续会按内容 bbox
+    裁剪；估低的后果则是内容直接丢失。
+
+    宽度单位：中文/全角字符占 2 个半宽，其余占 1 个。columns 列宽
+    可容纳 columns 个半宽单位，故行数 ≈ 总单位数 / columns。
+    """
+    if columns <= 0 or fontsize <= 0:
+        return 1600.0
+
+    units = 0
+    for ch in text:
+        if ch == "\n":
+            units += columns          # 强制换行：至少占满一行
+            continue
+        units += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+    lines = max(1, -(-units // columns))     # 向上取整
+    # ctexart 10pt 的 baselineskip 约 12pt，即 1.2 倍字号；
+    # 取 1.6 倍再乘 2 作余量，覆盖行间公式、大字号、上下标等撑高的情况。
+    return lines * fontsize * 1.6 * 2 + 200.0
 
 
 def build_width_setup(columns: int, enabled: bool = True) -> tuple[str, str]:
@@ -992,8 +1023,44 @@ def _image_size(png: str) -> tuple[int, int]:
             "无法解析图片尺寸（输出 %r）: %s" % (out.stdout.strip(), png))
 
 
+def _parse_color_rgb(color: str) -> tuple:
+    """
+    把颜色字符串解析成 (r, g, b)，每个分量 0-255。
+
+    支持 '#RRGGBB' / '#RGB' / 命名色（交给 ImageMagick 解析）。
+    无法解析时抛 RuntimeError。
+    """
+    c = color.strip()
+    # 容错：剥掉可能一并传入的 shell 引号
+    if len(c) >= 2 and c[0] == c[-1] and c[0] in "'\"":
+        c = c[1:-1].strip()
+
+    if c.startswith("#"):
+        body = c[1:]
+        if len(body) == 3 and all(ch in "0123456789abcdefABCDEF" for ch in body):
+            body = "".join(ch * 2 for ch in body)
+        if len(body) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in body):
+            return (int(body[0:2], 16), int(body[2:4], 16), int(body[4:6], 16))
+        raise RuntimeError("颜色格式错误: %r" % color)
+
+    # 命名色：让 ImageMagick 解析
+    r = subprocess.run(
+        [MAGICK, "xc:" + c,
+         "-format", "%[fx:int(255*r)].%[fx:int(255*g)].%[fx:int(255*b)]",
+         "info:"],
+        capture_output=True, text=True, timeout=60)
+    if r.returncode == 0:
+        try:
+            rr, gg, bb = (int(x) for x in r.stdout.strip().split("."))
+            return (rr, gg, bb)
+        except ValueError:
+            pass
+    raise RuntimeError("无法识别的颜色: %r" % color)
+
+
 def encode_transparent_sixel(png: str, fg: str,
-                             colors: int = 256) -> bytes:
+                             colors: int = 256,
+                             bg: str | None = None) -> bytes:
     """
     透传 sixel 编码器：只编码 alpha>0 的字形像素，背景像素不写色。
 
@@ -1070,58 +1137,62 @@ def encode_transparent_sixel(png: str, fg: str,
     is_greyscale = bool(opaque_rgb) and all(
         r == g == b for (r, g, b) in opaque_rgb[:4096])
 
-    # 前景色解析（仅 greyscale 快速路径需要）
-    fg_index = None
+    # 前景色：灰度文字统一拉到这个颜色，避免把抗锯齿的灰度分层
+    # 当成真实颜色带进调色板。
+    fg_rgb = None
     if is_greyscale and fg:
-        orig = fg
-        fg = fg.strip()
-        if len(fg) >= 2 and fg[0] == fg[-1] and fg[0] in "'\"":
-            fg = fg[1:-1].strip()
-        body = None
-        if fg.startswith("#"):
-            b2 = fg[1:]
-            if len(b2) == 3 and all(c in "0123456789abcdefABCDEF" for c in b2):
-                b2 = "".join(c * 2 for c in b2)
-            if len(b2) == 6 and all(c in "0123456789abcdefABCDEF" for c in b2):
-                body = b2
-        else:
-            # 命名色：交给 ImageMagick 解析成 RGB
-            r2 = subprocess.run(
-                [MAGICK, "xc:" + fg,
-                 "-format", "%[fx:int(255*r)].%[fx:int(255*g)].%[fx:int(255*b)]",
-                 "info:"],
-                capture_output=True, text=True, timeout=60)
-            if r2.returncode == 0:
-                try:
-                    rr, gg, bb = (int(x) for x in r2.stdout.strip().split("."))
-                    body = "%02x%02x%02x" % (rr, gg, bb)
-                except ValueError:
-                    body = None
-        if body is None:
-            raise RuntimeError("前景色格式错误: %r" % orig)
-        fg_rgb = (int(body[0:2], 16), int(body[2:4], 16), int(body[4:6], 16))
-        fg_index = idx_for(*fg_rgb)
+        fg_rgb = _parse_color_rgb(fg)
 
-    # 构建每个 6 行条带的颜色索引矩阵。
-    # pix_idx[y][x] = 0 表示该像素不写色（透明）。
-    bands = []
-    for y0 in range(0, h, 6):
-        rows = []
-        for k in range(6):
-            y = y0 + k
-            row = [0] * w
-            if y < h:
-                base = y * w
-                for x in range(w):
-                    o = (base + x) * 4
-                    if alphas[base + x] <= 32:
-                        continue
-                    if fg_index is not None:
-                        row[x] = fg_index
-                    else:
-                        row[x] = idx_for(data[o], data[o + 1], data[o + 2])
-            rows.append(row)
-        bands.append(rows)
+    # 参考背景色：只用于给字形边缘做 alpha 混合。
+    # sixel 没有 alpha 通道，若把 alpha 直接二值化，边缘就只剩"有/无"
+    # 两级，视觉上全是锯齿。把边缘像素按 alpha 混到终端背景色上，
+    # 等价于画出"字形→背景"的过渡，肉眼即是反锯齿。
+    # 空隙（alpha 极低）仍然不写色，所以背景依然是透的。
+    bg_rgb = None
+    if bg:
+        try:
+            bg_rgb = _parse_color_rgb(bg)
+        except RuntimeError:
+            bg_rgb = None
+
+    # alpha 低于此值视为空白，不写色（保留透传）。
+    # 取 24/255≈9%：再低就是肉眼不可见的噪点，写出来反而在
+    # 透明背景上形成淡淡的杂点。
+    A_MIN = 24
+
+    # alpha 量化级数。反锯齿不需要 200 多级灰度：把 alpha 归到
+    # 有限档位后，调色板规模从"每个边缘像素一色"降到"每档一色"，
+    # 输出体积和编码耗时都大幅下降。8 档在此尺寸下肉眼已看不出
+    # 阶梯（实测 55 级 -> 8 级，视觉无差别）。
+    A_STEPS = 8
+
+    def shade(base_rgb: tuple, a: float) -> tuple:
+        """按覆盖率 a 把 base 颜色混到背景色；无背景信息时原样返回。"""
+        if bg_rgb is None or a >= 0.985:
+            return base_rgb
+        # 量化到 A_STEPS 档，取档中点减少整体偏暗/偏亮
+        q = min(A_STEPS, int(a * A_STEPS) + 1)
+        aq = q / float(A_STEPS)
+        return tuple(int(round(c * aq + bk * (1.0 - aq)))
+                     for c, bk in zip(base_rgb, bg_rgb))
+
+    # 一次遍历算出每个像素的颜色索引，同时按带归档。
+    # 直接产出「每带每列的颜色位图」比"按颜色反复全扫条带"快得多：
+    # 后者是 6*w*颜色数 次操作，前者每像素只处理一次。
+    all_idx = [0] * (w * h)
+    for y in range(h):
+        base = y * w
+        for x in range(w):
+            idx = base + x
+            a8 = alphas[idx]
+            if a8 < A_MIN:
+                continue
+            if fg_rgb is not None:
+                base_rgb = fg_rgb
+            else:
+                o = idx * 4
+                base_rgb = (data[o], data[o + 1], data[o + 2])
+            all_idx[idx] = idx_for(*shade(base_rgb, a8 / 255.0))
 
     out = bytearray()
     out += b"\x1bP0;1;0q"                      # DCS + P2=1(透明) + q
@@ -1144,16 +1215,29 @@ def encode_transparent_sixel(png: str, fg: str,
     # 因此同一带内换色必须用 `$`，只有本带最后一个颜色才用 `-`。
     # 若对每个颜色都写 `-`，N 个颜色就把光标推进 N*6 行，
     # 图像会被拉成 N 倍高、各色错行——即"撕裂的点点"。
-    for rows in bands:
-        # 只编码本带实际出现的颜色。不在本带出现的颜色整带全空，
-        # 写出去只是一串 `?`，纯属浪费体积。
+    for y0 in range(0, h, 6):
+        # 扫一遍本带 6 行，按颜色收集每列的位掩码。
+        # 这样每个像素只处理一次，而不是"按颜色反复全扫条带"。
+        col_masks = [None] * w          # 每列：{颜色索引: 位掩码}
         present = []
         seen_local = set()
-        for row in rows:
-            for v in row:
-                if v and v not in seen_local:
-                    seen_local.add(v)
-                    present.append(v)
+        for k in range(6):
+            y = y0 + k
+            if y >= h:
+                break
+            base = y * w
+            bit = 1 << k
+            for x in range(w):
+                i = all_idx[base + x]
+                if not i:
+                    continue
+                m = col_masks[x]
+                if m is None:
+                    m = col_masks[x] = {}
+                m[i] = m.get(i, 0) | bit
+                if i not in seen_local:
+                    seen_local.add(i)
+                    present.append(i)
 
         if not present:
             # 整带全空：仍需推进 6 行，否则后续内容会错位
@@ -1161,12 +1245,13 @@ def encode_transparent_sixel(png: str, fg: str,
             continue
 
         for n, i in enumerate(present):
-            band = bytearray(w)
-            for k in range(6):
-                prow = rows[k]
-                for x in range(w):
-                    if prow[x] == i:
-                        band[x] |= (1 << k)
+            band = [0] * w
+            for x in range(w):
+                m = col_masks[x]
+                if m is not None:
+                    v = m.get(i)
+                    if v:
+                        band[x] = v
             # RLE 压缩（重复 >=4 次才值得写）
             parts = []
             p = 0
@@ -1190,10 +1275,11 @@ def encode_transparent_sixel(png: str, fg: str,
 
 
 def png_to_sixel_transparent(png: str, fg: str,
-                             colors: int = 256) -> None:
+                             colors: int = 256,
+                             bg: str | None = None) -> None:
     """透传模式：编码并写到 stdout。"""
     try:
-        sixel = encode_transparent_sixel(png, fg, colors)
+        sixel = encode_transparent_sixel(png, fg, colors, bg)
     except (RuntimeError, OSError) as e:
         sys.stderr.write("sixeltex: sixel 编码失败: %s\n" % e)
         sys.exit(1)
@@ -1362,13 +1448,10 @@ def render(text: str, args: argparse.Namespace) -> None:
         fields["math_font"] = args.math_font
 
     # 颜色：命令行优先，否则探测。
-    # 透传模式下背景色根本不用写进输出，故跳过 OSC 11 查询——
-    # 那是几百毫秒的等待，白花。
+    # 背景色在透传模式下不写进输出，但要用作字形边缘的混合参考色
+    # （sixel 无 alpha，靠它把抗锯齿边缘画出来），所以仍需探测。
     fg = args.color if args.color else detect_fg()
-    if args.transparent:
-        bg = args.bgcolor or DEFAULT_BG
-    else:
-        bg = args.bgcolor if args.bgcolor else detect_bg()
+    bg = args.bgcolor if args.bgcolor else detect_bg()
 
     # 两层字号，不可混淆：
     #   终端字号  —— 探测得到，只用于算 DPI（结果经 _CELL_H_PX 传递）
@@ -1399,7 +1482,10 @@ def render(text: str, args: argparse.Namespace) -> None:
     if not args.no_wrap:
         paper_w = (columns / 2.0) * fontsize
         fields["paper_w"] = "%.3fpt" % paper_w
-        fields["paper_h"] = "%.3fpt" % max(paper_w * 4.0, 200.0)
+        # 页面高度按输入长度估算，避免内容分页后被 -singlefile 丢掉
+        fields["paper_h"] = "%.3fpt" % max(
+            estimate_paper_height(text, columns, fontsize),
+            paper_w * 4.0, 200.0)
 
     # DPI 分两层，这是解决"发糊"的关键：
     #   base_dpi —— 目标数据的等效 DPI，使公式字高与终端文字一致
@@ -1481,7 +1567,7 @@ def render(text: str, args: argparse.Namespace) -> None:
                 dest = os.path.abspath(args.keep_png)
                 shutil.copyfile(png, dest)
                 sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
-            png_to_sixel_transparent(png, fg, args.colors)
+            png_to_sixel_transparent(png, fg, args.colors, bg)
         else:
             # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
             png = resize_for_terminal(png, target_w=target_w,
@@ -1542,8 +1628,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--color", default=None,
                    help="前景色，命名色或 #RRGGBB。默认 OSC 探测终端色")
     p.add_argument("-b", "--bgcolor", default=None,
-                   help="背景色，仅在 --opaque 下生效（此为合到底色，"
-                        "非 LaTeX 页面背景）。透传模式不使用此参数")
+                   help="背景色（非 LaTeX 页面背景）。--opaque 下作为合到底色；"
+                        "透传模式下作为字形边缘的混合参考色——sixel 无 alpha，"
+                        "边缘靠混到这个颜色来产生平滑过渡")
     p.add_argument("-m", "--margin", type=int, default=0,
                    help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
     p.add_argument("-S", "--math-scale", dest="math_scale", type=float,
@@ -1572,7 +1659,8 @@ def build_parser() -> argparse.ArgumentParser:
     bg_mode.add_argument("--transparent", dest="transparent",
                          action="store_true", default=True,
                          help="透传背景（默认）：只画字形像素，背景不写色，"
-                              "终端原有背景/壁纸原样透出。DCS 用 P2=1 告知终端")
+                              "终端原有背景/壁纸原样透出。DCS 用 P2=1 告知终端；"
+                              "字形边缘按 alpha 混到 -b/探测到的背景色以获得反锯齿")
     bg_mode.add_argument("--opaque", dest="transparent", action="store_false",
                          help="不透明模式：把透明渲染结果合成到 -b/探测到的"
                               "背景色上。用于不支持 P2=1 的老终端，或需要"
