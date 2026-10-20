@@ -815,7 +815,7 @@ def _bbox_from_pdftotext(pdf: str) -> tuple[float, float, float, float] | None:
     return min(xs0), min(ys0), max(xs1), max(ys1)
 
 
-def crop_pdf(pdf: str, workdir: str, pad_pt: float = 1.0,
+def crop_pdf(pdf: str, workdir: str, pad_pt: float = 4.0,
              keep_width: bool = True) -> str:
     r"""
     计算内容边界后写进 CropBox，得到紧凑页面。
@@ -825,6 +825,11 @@ def crop_pdf(pdf: str, workdir: str, pad_pt: float = 1.0,
       2. ghostscript 的 HiResBoundingBox —— 覆盖纯图形（tikz 线条等无字符内容）
 
     再四周各留 pad_pt(pt) 安全边距，避免抗锯齿边缘被切。
+
+    pad_pt 取 4.0 而非 1.0：bbox 终究是估算，字符的降部、积分号下端等
+    可能略微超出。1pt 经超采样缩放后只剩约 1px，任何舍入偏差都会让末行
+    底部被切（实测多列宽下底部留白都只有 1px）。4pt 缩放后约 6px，
+    肉眼几乎不增加空白，但足够兜住估算误差。
 
     keep_width=True 时左右不裁剪，保留整页宽度（页面宽度本身已按终端列数
     设定），只裁剪上下。左右裁紧会在两端切掉字形边缘或间距，故默认保留。
