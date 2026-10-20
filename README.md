@@ -22,7 +22,7 @@ command -v xelatex gs pdftocairo pdftotext pdfinfo magick
 install -m 755 sixeltex ~/.local/bin/sixeltex
 
 # 3. 验证
-sixeltex '\frac{1}{1+x}'
+sixeltex '$\frac{1}{1+x}$'
 ```
 
 `~/.local/bin` 通常已在 `$PATH` 里。如果没有，改成 `sudo install -m 755 sixeltex /usr/local/bin/`。
@@ -46,7 +46,7 @@ Python 仅需标准库（3.9+ 即可），不需要 pip 安装任何包。
 | 渲染引擎 | 纯 Python ziamath | 真实 xelatex |
 | 中文 | **不支持** | 支持（ctex + fontspec） |
 | 输入 | 只吃裸数学表达式 | 表达式 **或** 完整 .tex 文件 |
-| 定界符 | 自己拼 | 自动判定，`\$...\$` 可直接用 |
+| 定界符 | 自己拼 | **不猜**：输入按文本模式编译，`$...$` 由你自己写 |
 | 背景 | 固定深色 | 自动探测终端背景色并合成 |
 | 环境 | 写死在代码 | 单一参数化模板表 |
 
@@ -55,14 +55,14 @@ Python 仅需标准库（3.9+ 即可），不需要 pip 安装任何包。
 ## 快速开始
 
 ```bash
-# 单个公式
-sixeltex '\frac{1}{1+x}'
+# 行内公式（$...$ 由你写）
+sixeltex '$x^2$'
 
-# 带 $ 也照样能用（会自动剥掉）
-sixeltex '\$E = mc^2\$'
+# 行间公式（$$...$$）
+sixeltex '$$\frac{1}{1+x}$$'
 
 # 标准输入
-echo 'x^2 + y^2 = z^2' | sixeltex
+echo '设 $f(x)=x^2$，则 $f'(x)=2x$' | sixeltex
 
 # 中文 + 数学混排
 sixeltex '设 \$f(x)=x^2\$，则 \$f''(x)=2x\$'
@@ -73,25 +73,38 @@ sixeltex ~/文档/论文.tex
 
 ---
 
-## 输入模式：自动判定
+## 输入模式
 
 脚本看输入里有没有 `\documentclass`：
 
 - **有** → 完整文件模式，输入原样交给 xelatex，不套模板
-- **没有** → 表达式模式，输入被包进模板的 `\begin{document}...\end{document}` 之间
+- **没有** → 表达式模式，输入**按文本模式原样编译**
 
-### 表达式模式下的自动包装策略
+### 表达式模式：输入即文本
 
-| 输入形态 | 处理方式 |
-|---|---|
-| `\frac{1}{1+x}` | 套 `\[ ... \]` 行间公式 |
-| `\$E=mc^2\$` | 剥掉外层 `\$`，套 `\[ ... \]` |
-| 含 `pmatrix`/`align`/`cases` 等数学环境 | 外层补 `\[ ... \]`（否则报 `Missing $ inserted`） |
-| 含中文或正文文字 | 原样作正文段落，内部 `\$...\$` 交给 LaTeX 处理 |
-| 多行 / 含 `\\` | 套 `align*` |
+sixeltex **不猜测**你的输入是数学还是正文，也不自动补任何定界符。
+输入被原样放进 `\begin{document}...\end{document}` 之间，
+数学模式的唯一来源是你自己写的定界符：
 
-> 最后一条是实测踩出来的：中英混排内容若被强行套 `\[...\]`，内嵌的 `\$...\$`
-> 会和外层定界符冲突，报 `Display math should end with \$\$`。
+| 定界符 | 模式 | 示例 |
+|---|---|---|
+| `$...$` | 行内公式 | `sixeltex '$x^2$'` |
+| `$$...$$` | 行间公式 | `sixeltex '$$\frac{1}{1+x}$$'` |
+| `\[...\]` | 行间公式（LaTeX 原生写法） | `sixeltex '\[ x^2 \]'` |
+
+**为什么不再自动包装**：自动包定界符必须先猜"这是数学还是正文"，
+猜错就有两类后果——
+
+- 把正文套进 `\[...\]` 会改变排版语义（正文变行间公式）
+- 把 `$...$` 套进 `\[...\]` 则直接报 `Display math should end with $$`
+
+去掉猜测后行为完全可预测：**你想行间公式就自己写 `$$...$$`，
+想行内公式就写 `$...$，工具不再介入。**
+
+> ⚠️ **破坏性变更**：早期版本会把裸数学输入（如 `sixeltex 'x^2'`）
+> 自动包成 `\[...\]`。现在这类输入按文本模式编译，会报
+> `Missing $ inserted`。请改用 `sixeltex '$x^2$'`。
+> 报错时 sixeltex 会给出这条提示。
 
 ---
 
@@ -102,7 +115,7 @@ sixeltex ~/文档/论文.tex
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-s`, `--size` | 自动探测 | 文档类字号(pt)。默认用 CSI 14t/18t 探测终端字号，探测失败回退 **10pt**。LaTeX 只认 10/11/12 档位，其他值静默归到最接近档位 |
-| `-S`, `--math-scale` | 不缩放 | 数学公式连续缩放倍数，如 `1.5` / `0.8`。实测 0.5/1.5/2.0 输出 39/115/153 px，线性生效 |
+| `-S`, `--math-scale` | 不缩放 | 连续缩放倍数，如 `1.5` / `0.8`。仅对纯数学生效；含中文或西文单词的正文不缩放（会把文本套进数学模式） |
 | `-d`, `--dpi` | 自动反算 | 光栅化 DPI。默认按 `-W` 与字号反算，使内容恰好占满列数 |
 | `-W`, `--cell-width` | `8` | 终端一个字符格的像素宽，决定图占多少列 |
 | `-m`, `--margin` | `0` | 四周额外留白(像素)。内容边界由 ghostscript 自动算，通常不需要手动留白 |
@@ -274,25 +287,25 @@ vendor/icat/linux-amd64/
 
 ```bash
 # 深色终端下默认就好看
-sixeltex '\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}'
+sixeltex '$\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}$'
 
 # 浅色终端：白底黑字
-sixeltex -c '#000000' -b '#ffffff' 'x^2'
+sixeltex -c '#000000' -b '#ffffff' '$x^2$'
 
 # 公式放大 1.5 倍
-sixeltex -S 1.5 '\sum_{n=1}^{\infty}\frac{1}{n^2}'
+sixeltex -S 1.5 '$\sum_{n=1}^{\infty}\frac{1}{n^2}$'
 
 # 矩阵
-sixeltex '\begin{pmatrix} a & b \\ c & d \end{pmatrix}'
+sixeltex '$\begin{pmatrix} a & b \\ c & d \end{pmatrix}$'
 
 # 用 tikz 画图（需 -P 加载宏包）
-sixeltex -P tikz '\begin{tikzpicture}\draw (0,0)--(1,1);\end{tikzpicture}'
+sixeltex -P tikz '$\begin{tikzpicture}\draw (0,0)--(1,1);\end{tikzpicture}$'
 
 # 中文报告
 sixeltex -t ctexrep -C 'Noto Serif CJK SC' 报告.tex
 
 # 先看生成的 LaTeX 源，确认无误再渲染
-sixeltex -n -S 2.0 '\frac{1}{1+x}'
+sixeltex -n -S 2.0 '$\frac{1}{1+x}$'
 
 # 保存 PNG 备用
 sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
@@ -306,6 +319,8 @@ sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
 |---|---|
 | `缺少依赖: xxx` | 装对应组件后重试 |
 | `xelatex 编译失败` + 日志尾部 | 看 `-K` 保留目录里的 `xelatex.log`；LaTeX 语法错误会带 `!` 行号和 `l.NN` 出错行 |
+| `Missing $ inserted` | 输入按文本模式编译，但含 `^` `_` 等数学字符。用 `$...$` 包住：`sixeltex '$x^2$'` |
+| `Display math should end with $$` | `$...$` 与 `$$...$$` 定界符嵌套冲突，检查是否多写了一层 |
 | `警告：检测到 N 个缺字` | 字体不含所需字形，换 `-C` / `-M` / `-L` |
 | `无法解析前景色` | 颜色值不合法，已自动回落默认值 |
 | `字号 Npt 不是 LaTeX 标准档位` | 已归到最接近的 10/11/12pt；要连续缩放用 `-S` |
