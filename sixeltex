@@ -904,7 +904,8 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
 
 
 def resize_for_terminal(png: str, target_w: int | None = None,
-                        supersample: int = 1) -> str:
+                        supersample: int = 1,
+                        colors: int | None = None) -> str:
     r"""
     把高 DPI 渲染出的 PNG 缩到终端像素尺寸，并对齐 sixel 条带高度。
 
@@ -934,9 +935,15 @@ def resize_for_terminal(png: str, target_w: int | None = None,
             new_w = max(1, w // supersample)
             new_h = max(1, h // supersample)
         scaled = os.path.join(work, "sixeltex-scaled.png")
+        cmd = [MAGICK, png, "-filter", "Lanczos",
+               "-resize", "%dx%d!" % (new_w, new_h)]
+        # 缩放后立即量化到指定颜色数。Lanczos 会在字形边缘产生大量
+        # 抗锯齿中间色（实测 231 种），若不在此收敛，这些颜色会全部
+        # 带进 sixel 调色板，既臃肿又让边缘发灰。
+        if colors and colors > 1:
+            cmd += ["-colors", str(int(colors))]
         subprocess.run(
-            [MAGICK, png, "-filter", "Lanczos",
-             "-resize", "%dx%d!" % (new_w, new_h), scaled],
+            cmd + [scaled],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=300, check=True)
         png, w, h = scaled, new_w, new_h
@@ -985,19 +992,28 @@ def _image_size(png: str) -> tuple[int, int]:
             "无法解析图片尺寸（输出 %r）: %s" % (out.stdout.strip(), png))
 
 
-def encode_transparent_sixel(png: str, fg: str) -> bytes:
+def encode_transparent_sixel(png: str, fg: str,
+                             colors: int = 256) -> bytes:
     """
     透传 sixel 编码器：只编码 alpha>0 的字形像素，背景像素不写色。
 
-    这样终端的原有背景/内容能透出来，实现"背景完全透明"
-    （sixel 协议本身无 alpha 通道，只能用"不写背景色"达到透传效果）。
+    这样终端的原有背景/内容能透出来，实现"背景完全透明"（sixel 协议本身无 alpha 通道，只能用"不写背景色"达到透传效果）。
 
-    为什么不用 ImageMagick 的 sixel coder：它无法表达"背景不写色"，
-    会把 alpha=0 的区域量化成某个不透明色（实测：全透明图被编码成
-    颜色 0 = 黑色铺满）。libsixel 的 img2sixel 在部分构建下输出恒为
-    0 字节，故自写编码器。本编码器输出已用 libsixel 自带的 sixel2png
-    反向解码验证通过。
+    DCS 头用 P2=1（background color mode = transparent）告诉终端空像素保持原样。
+    foot 的 sixel.c 即以 p2 == 1 判定透明；若发 P2=0（如 icat/ImageMagick 默认），空像素会被填成当前背景色。
+
+    颜色支持：
+      * 默讨用 ImageMagick 把图量化到 `colors` 色的自适应调色版，逐像素按调色版索引编码，
+        因此彩色内容（tikz / \textcolor 等）能正确呈现。
+      * `fg` 仅在图片本就是嗅嗃（零色）时作为固定前景色：此时跳过量化，
+        把所有字形像素统一拉到前景色，避免量匒把反锯齿过程产生的灰度分层。
+
+    为什么不用 ImageMagick 的 sixel coder：它无法表达"背景不写色"，会把 alpha=0 的区域量化成某个不透明色。
+    libsixel 的 img2sixel 在部分构建下输出恒为 0 字节，故自写编码器。
+    本编码器输出已用 libsixel 自带的 sixel2png 反向解码验证过。
     """
+    import colorsys
+
     # 取 RGBA 原始像素
     proc = subprocess.run([MAGICK, png, "-depth", "8", "rgba:-"],
                           capture_output=True, timeout=300)
@@ -1006,90 +1022,165 @@ def encode_transparent_sixel(png: str, fg: str) -> bytes:
     data = proc.stdout
     w, h = _image_size(png)
     if len(data) != w * h * 4:
-        raise RuntimeError("像素数据长度不符: %d != %d" % (len(data), w * h * 4))
+        raise RuntimeError("像素数据长度不符: %d != %d"
+                           % (len(data), w * h * 4))
 
-    # 前景色 -> RGB(0-100)，sixel 用百分比表示
-    # 支持三种输入：'#RRGGBB' / '#RGB' / 命名色（如 'red'）
-    # 注意：'#RGB' 的 3 位缩写展开只对带 # 的十六进制生效，
-    # 否则 'red' 这类命名色会被误当成缩写展开成 'rreedd'。
-    orig = fg
-    # 容错：剥掉可能一并传入的 shell 引号
-    fg = fg.strip()
-    if len(fg) >= 2 and fg[0] == fg[-1] and fg[0] in "'\"":
-        fg = fg[1:-1].strip()
-    if fg.startswith("#"):
-        body = fg[1:]
-        if len(body) == 3 and all(c in "0123456789abcdefABCDEF" for c in body):
-            body = "".join(c * 2 for c in body)
-        if len(body) != 6 or not all(c in "0123456789abcdefABCDEF" for c in body):
-            raise RuntimeError("前景色格式错误: %r" % orig)
-        hexrgb = body
-    else:
-        # 命名色：交给 ImageMagick 解析成 RGB
-        r = subprocess.run(
-            [MAGICK, "xc:" + fg, "-format", "%[fx:int(255*r)].%[fx:int(255*g)].%[fx:int(255*b)]",
-             "info:"],
-            capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError("无法识别的颜色名: %r" % orig)
-        try:
-            rr, gg, bb = (int(x) for x in r.stdout.strip().split("."))
-        except ValueError:
-            raise RuntimeError("无法识别的颜色名: %r" % orig)
-        hexrgb = "%02x%02x%02x" % (rr, gg, bb)
+    # 颜色表：(r,g,b) -> 索引；索引从 1 开始，0 保留给"不写色"。
+    # max_colors 同时是调色板容量：超出后新颜色归入最接近的已有色。
+    palette = {}
+    index_of = {}
+    max_colors = max(2, min(int(colors), 255))
+    # 调色板已满时的最近邻缓存：同一个 RGB 不必反复重算
+    near_of: dict = {}
 
-    try:
-        fr, fgc, fb = (int(hexrgb[i:i + 2], 16) for i in (0, 2, 4))
-    except ValueError:
-        raise RuntimeError("前景色格式错误: %r" % orig)
-    # 0-255 -> 0-100（四舍五入，避免 truncation 偏差）
-    pr = int(round(fr * 100 / 255.0))
-    pg = int(round(fgc * 100 / 255.0))
-    pb = int(round(fb * 100 / 255.0))
+    def idx_for(r: int, g: int, b: int) -> int:
+        key = (r, g, b)
+        i = index_of.get(key)
+        if i is not None:
+            return i
+
+        if len(palette) < max_colors:
+            i = len(palette) + 1
+            palette[i] = key
+            index_of[key] = i
+            return i
+
+        # 调色板已满：归入最接近的已有色
+        i = near_of.get(key)
+        if i is not None:
+            return i
+        best, best_d = 1, None
+        for (pr2, pg2, pb2), pi in index_of.items():
+            d = (pr2 - r) ** 2 + (pg2 - g) ** 2 + (pb2 - b) ** 2
+            if best_d is None or d < best_d:
+                best, best_d = pi, d
+        near_of[key] = best
+        return best
 
     # alpha 阈值二值化：>32 视为字形（滤掉抗锯齿边缘的微透明）
-    mask = data[3::4]
-    glyph = [1 if a > 32 else 0 for a in mask]
+    alphas = data[3::4]
+
+    # 决定是否走"固定前景色"快速路径：图片本质上是否嗁嗃。
+    # 判据：取所有不透明像素，若它们的饱和度全都为 0（灰度），
+    # 则认为是嗁嗃文字，用 fg 统一拉到前景色。
+    opaque_rgb = []
+    for i in range(0, len(data), 4):
+        if data[i + 3] > 32:
+            opaque_rgb.append((data[i], data[i + 1], data[i + 2]))
+    is_greyscale = bool(opaque_rgb) and all(
+        r == g == b for (r, g, b) in opaque_rgb[:4096])
+
+    # 前景色解析（仅 greyscale 快速路径需要）
+    fg_index = None
+    if is_greyscale and fg:
+        orig = fg
+        fg = fg.strip()
+        if len(fg) >= 2 and fg[0] == fg[-1] and fg[0] in "'\"":
+            fg = fg[1:-1].strip()
+        body = None
+        if fg.startswith("#"):
+            b2 = fg[1:]
+            if len(b2) == 3 and all(c in "0123456789abcdefABCDEF" for c in b2):
+                b2 = "".join(c * 2 for c in b2)
+            if len(b2) == 6 and all(c in "0123456789abcdefABCDEF" for c in b2):
+                body = b2
+        else:
+            # 命名色：交给 ImageMagick 解析成 RGB
+            r2 = subprocess.run(
+                [MAGICK, "xc:" + fg,
+                 "-format", "%[fx:int(255*r)].%[fx:int(255*g)].%[fx:int(255*b)]",
+                 "info:"],
+                capture_output=True, text=True, timeout=60)
+            if r2.returncode == 0:
+                try:
+                    rr, gg, bb = (int(x) for x in r2.stdout.strip().split("."))
+                    body = "%02x%02x%02x" % (rr, gg, bb)
+                except ValueError:
+                    body = None
+        if body is None:
+            raise RuntimeError("前景色格式错误: %r" % orig)
+        fg_rgb = (int(body[0:2], 16), int(body[2:4], 16), int(body[4:6], 16))
+        fg_index = idx_for(*fg_rgb)
+
+    # 构建每个 6 行条带的颜色索引矩阵。
+    # pix_idx[y][x] = 0 表示该像素不写色（透明）。
+    bands = []
+    for y0 in range(0, h, 6):
+        rows = []
+        for k in range(6):
+            y = y0 + k
+            row = [0] * w
+            if y < h:
+                base = y * w
+                for x in range(w):
+                    o = (base + x) * 4
+                    if alphas[base + x] <= 32:
+                        continue
+                    if fg_index is not None:
+                        row[x] = fg_index
+                    else:
+                        row[x] = idx_for(data[o], data[o + 1], data[o + 2])
+            rows.append(row)
+        bands.append(rows)
 
     out = bytearray()
-    out += b"\x1bP0;1;0q"                      # DCS + P1;P2;P3 + q
+    out += b"\x1bP0;1;0q"                      # DCS + P2=1(透明) + q
     out += ('"1;1;%d;%d' % (w, h)).encode()    # 栅格属性
-    out += ("#1;2;%d;%d;%d" % (pr, pg, pb)).encode()  # 颜色1 = 前景
-    # 逐 6 行条带编码；每列一个字节，bit0..5 对应该列 6 个像素
-    for y0 in range(0, h, 6):
-        band = bytearray(w)
-        for x in range(w):
-            b = 0
-            base = y0 * w + x
+
+    # 调色版定义：sixel 用百分比 (0-100) 表示颜色分量
+    for i in sorted(palette):
+        r, g, b = palette[i]
+        out += ("#%d;2;%d;%d;%d" % (
+            i,
+            int(round(r * 100 / 255.0)),
+            int(round(g * 100 / 255.0)),
+            int(round(b * 100 / 255.0)))).encode()
+
+    # 逐条带编码：每个颜色分别编证该条带内的像素位。
+    # 同一像素只属于一个颜色（后写的覆盖先写的），
+    # 因此需覄则"先出现的颜色先编码"以避免相互覆盖。
+    order = []
+    seen = set()
+    for rows in bands:
+        for row in rows:
+            for v in row:
+                if v and v not in seen:
+                    seen.add(v)
+                    order.append(v)
+
+    for rows in bands:
+        for i in order:
+            band = bytearray(w)
             for k in range(6):
-                y = y0 + k
-                if y < h and glyph[base + k * w]:
-                    b |= (1 << k)
-            band[x] = b
-        # RLE 压缩（重复 >=4 次才值得写）
-        parts = []
-        i = 0
-        while i < w:
-            j = i
-            v = band[i]
-            while j < w and band[j] == v:
-                j += 1
-            cnt = j - i
-            ch = chr(v + 63)
-            if cnt >= 4:
-                parts.append("!%d%s" % (cnt, ch))
-            else:
-                parts.append(ch * cnt)
-            i = j
-        out += b"#1" + "".join(parts).encode("ascii") + b"-"
+                prow = rows[k]
+                for x in range(w):
+                    if prow[x] == i:
+                        band[x] |= (1 << k)
+            # RLE 压缩（重复 >=4 次才值得写）
+            parts = []
+            p = 0
+            while p < w:
+                q2 = p
+                v = band[p]
+                while q2 < w and band[q2] == v:
+                    q2 += 1
+                cnt = q2 - p
+                ch = chr(v + 63)
+                if cnt >= 4:
+                    parts.append("!%d%s" % (cnt, ch))
+                else:
+                    parts.append(ch * cnt)
+                p = q2
+            out += ("#%d" % i).encode() + "".join(parts).encode("ascii") + b"-"
     out += b"\x1b\\"                            # ST
     return bytes(out)
 
 
-def png_to_sixel_transparent(png: str, fg: str) -> None:
+def png_to_sixel_transparent(png: str, fg: str,
+                             colors: int = 256) -> None:
     """透传模式：编码并写到 stdout。"""
     try:
-        sixel = encode_transparent_sixel(png, fg)
+        sixel = encode_transparent_sixel(png, fg, colors)
     except (RuntimeError, OSError) as e:
         sys.stderr.write("sixeltex: sixel 编码失败: %s\n" % e)
         sys.exit(1)
@@ -1354,7 +1445,8 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 透传模式：只画字形像素，背景不写色（DCS 的 P2=1）。
             # 与默认路径同样需要先缩到终端像素尺寸并对齐 6 行条带。
             png = resize_for_terminal(png, target_w=target_w,
-                                      supersample=supersample)
+                                      supersample=supersample,
+                                      colors=args.colors)
             if args.margin and args.margin > 0:
                 bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
                 subprocess.run(
@@ -1368,11 +1460,12 @@ def render(text: str, args: argparse.Namespace) -> None:
                 dest = os.path.abspath(args.keep_png)
                 shutil.copyfile(png, dest)
                 sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
-            png_to_sixel_transparent(png, fg)
+            png_to_sixel_transparent(png, fg, args.colors)
         else:
             # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
             png = resize_for_terminal(png, target_w=target_w,
-                                      supersample=supersample)
+                                      supersample=supersample,
+                                      colors=args.colors)
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
             composite_bg(png, bg, final, args.margin)
             # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）
