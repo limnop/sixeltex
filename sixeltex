@@ -205,6 +205,98 @@ def _osc_geometry_query(timeout: float = 0.4) -> tuple[int, int, int, int] | Non
             pass
 
 
+def _osc_cursor_row(timeout: float = 0.3) -> int | None:
+    r"""
+    查询光标当前所在行（1-based）。失败返回 None。
+
+    用 DSR（CSI 6 n），终端回复 CSI 行 ; 列 R。
+    用途：sixel 图像从光标处向下画，且终端**不会**为放不下的图像滚动，
+    而是直接裁掉超出窗口的部分（实测：图像比剩余行数高时，底部内容消
+    失，表现为最后一行只露出顶端几个像素）。所以画之前要先确认下方有
+    足够行数，不够就补换行让终端先滚屏。
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        return None
+    try:
+        fd = sys.stdin.fileno()
+        orig = termios.tcgetattr(fd)
+    except (OSError, ValueError):
+        return None
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[6n")
+        sys.stdout.flush()
+        buf = b""
+        deadline = _monotonic() + timeout
+        while _monotonic() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if not r:
+                continue
+            ch = os.read(fd, 64)
+            if not ch:
+                break
+            buf += ch
+            m = re.search(rb"\x1b\[(\d+);(\d+)R", buf)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, orig)
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def ensure_viewport_room(image_h_px: int, cell_h_px: float | None,
+                         verbose: bool = False) -> None:
+    r"""
+    确保终端光标下方有足够行数容纳图像；不够就先补换行让终端滚屏。
+
+    背景：sixel 图像从光标处向下绘制，终端的滚动是"行"触发的——图像本身
+    不会让终端滚动。若剩余行数不足，超出窗口底边的部分会被直接裁掉，
+    表现为尾部内容消失（最后一行只剩顶端几个像素）。用户半屏使用时
+    尤其容易触发：命令行本身的折行已经把光标推到接近底部。
+    """
+    if not cell_h_px or cell_h_px <= 0 or image_h_px <= 0:
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    need = int(-(-image_h_px // int(round(cell_h_px))))
+    geo = _osc_geometry_query()
+    if geo is None:
+        return
+    _px_h, _px_w, rows, _cols = geo
+    if not rows:
+        return
+    row = _osc_cursor_row()
+    if row is None:
+        return
+    if need > rows:
+        # 比整个窗口还高：滚屏也无济于事，终端一定会裁掉超出部分。
+        # 明确告知，别让用户以为内容丢了。
+        sys.stderr.write(
+            "sixeltex: 警告：图像高 %d 行，超过窗口的 %d 行，"
+            "底部会被终端裁掉（放大窗口或减少内容）\n" % (need, rows))
+        return
+    avail = rows - row + 1
+    if need > avail:
+        deficit = need - avail
+        sys.stdout.write("\n" * deficit)
+        sys.stdout.flush()
+        if verbose:
+            sys.stderr.write(
+                "sixeltex: 图像需 %d 行，光标在第 %d 行（剩余 %d 行），"
+                "先补 %d 个换行滚屏\n" % (need, row, avail, deficit))
+
+
 def _monotonic() -> float:
     import time
     return time.monotonic()
@@ -1621,10 +1713,10 @@ def render(text: str, args: argparse.Namespace) -> None:
                 dest = os.path.abspath(args.keep_png)
                 shutil.copyfile(png, dest)
                 sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
+            fw, fh = _image_size(png)
+            ensure_viewport_room(fh, _CELL_H_PX, args.verbose)
             if args.verbose:
-                fw, fh = _image_size(png)
-                sys.stderr.write("sixeltex: 输出图像 %dx%d px（含底部留白）\n"
-                                 % (fw, fh))
+                sys.stderr.write("sixeltex: 输出图像 %dx%d px\n" % (fw, fh))
             png_to_sixel_transparent(png, fg, args.colors, bg)
         else:
             # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
@@ -1642,8 +1734,9 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 图片尺寸本身已按探测到的终端宽度算好，这里只是告诉 icat
             # 按原样显示、不要再缩放（它的自动适配会引入尺寸漂移）。
             final_w, final_h = _image_size(final)
+            ensure_viewport_room(final_h, _CELL_H_PX, args.verbose)
             if args.verbose:
-                sys.stderr.write("sixeltex: 输出图像 %dx%d px（含底部留白）\n"
+                sys.stderr.write("sixeltex: 输出图像 %dx%d px\n"
                                  % (final_w, final_h))
             png_to_sixel_opaque(final, args.colors, final_w, final_h)
     finally:
