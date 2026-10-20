@@ -460,7 +460,8 @@ LINE_SPREAD = 1.25
 # 正文毫发无损。代价是排版正常时底部也会多出这几行空白，属已知取舍。
 #
 # 0 表示不预留（旧行为：窗口不够高时末尾内容会被裁掉）。
-SAFE_BOTTOM_PAD_ROWS = 2
+# 这是默认值，可用 --sacrifice-rows 按次覆盖。
+SAFE_BOTTOM_PAD_ROWS = 1
 
 
 
@@ -1048,16 +1049,16 @@ def resize_for_terminal(png: str, target_w: int | None = None,
     return png
 
 
-def _safe_pad_px() -> int:
+def _safe_pad_px(rows: int) -> int:
     """
-    底部垫背空白该留多少像素：SAFE_BOTTOM_PAD_ROWS 个终端行高。
+    底部垫背空白该留多少像素：rows 个终端行高。
 
     终端行高优先用探测值；拿不到时按 16px 兜底（与 DPI 反算的兜底一致）。
     """
-    if SAFE_BOTTOM_PAD_ROWS <= 0:
+    if not rows or rows <= 0:
         return 0
     cell_h = _CELL_H_PX if _CELL_H_PX else 16.0
-    return int(round(SAFE_BOTTOM_PAD_ROWS * cell_h))
+    return int(round(rows * cell_h))
 
 
 def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
@@ -1635,7 +1636,7 @@ def render(text: str, args: argparse.Namespace) -> None:
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
                                       colors=args.colors,
-                                      extra_bottom_px=_safe_pad_px())
+                                      extra_bottom_px=_safe_pad_px(args.sacrifice_rows))
             if args.margin and args.margin > 0:
                 bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
                 subprocess.run(
@@ -1659,7 +1660,7 @@ def render(text: str, args: argparse.Namespace) -> None:
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
                                       colors=args.colors,
-                                      extra_bottom_px=_safe_pad_px())
+                                      extra_bottom_px=_safe_pad_px(args.sacrifice_rows))
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
             composite_bg(png, bg, final, args.margin)
             # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）
@@ -1721,6 +1722,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="背景色（非 LaTeX 页面背景）。--opaque 下作为合到底色；"
                         "透传模式下作为字形边缘的混合参考色——sixel 无 alpha，"
                         "边缘靠混到这个颜色来产生平滑过渡")
+    p.add_argument("--sacrifice-rows", dest="sacrifice_rows", type=int,
+                   default=SAFE_BOTTOM_PAD_ROWS, metavar="N",
+                   help="预备牺牲行数，默认 %d。在图像底部多渲染 N 个终端行高的"
+                        "透明像素当垫背：终端空间不足时先裁掉这些空白，正文不受影响。"
+                        "0 表示不预留（空间不足时末尾内容会被裁掉）"
+                        % SAFE_BOTTOM_PAD_ROWS)
     p.add_argument("-m", "--margin", type=int, default=0,
                    help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
     p.add_argument("-S", "--math-scale", dest="math_scale", type=float,
