@@ -441,16 +441,16 @@ DEFAULT_CELL_W_PX = 8.0
 # 但那样正文的字面会略大于终端字体（终端字符格通常比 1/2 em 高），
 # 看起来"公式比终端字大"。取 1.8 让正文略小一号，视觉上与终端字号
 # 更接近；同时每行能多排一些字。
-EM_CELLS = 1.65
+EM_CELLS = 1.62
 
 # 中文字间距（em）。0 表示不额外加宽；ctex/xeCJK 默认的 CJKglue 让汉字
 # 紧贴在一起，密集段落会显得很挤，加一点点空隙更易读。
-LETTER_SPACE_EM = 0.06
+LETTER_SPACE_EM = 0.10
 
 # 行距倍数（\linespread）。1.0 = LaTeX 默认（ctexart 10pt 下约 12pt）。
 # 注意：这个值直接决定行间距，与字号无关；调大只是把行与行拉开，
 # 字形大小不变。
-LINE_SPREAD = 1.15
+LINE_SPREAD = 1.25
 
 
 def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
@@ -979,17 +979,24 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
     return png
 
 
-def _ink_bbox(png: str) -> tuple:
+def _ink_bbox(png: str, alpha_pct: int = 0) -> tuple:
     """
-    返回图像中"非透明墨迹"的包围盒 (w, h, x, y)。
+    返回图像中"可见墨迹"的包围盒 (w, h, x, y)。
 
-    用 ImageMagick 的 %@ （trim 包围盒）：以四角像素为背景色找出内容范围。
-    透传 PNG 的四角是透明的，因此这里得到的就是字形实际占据的区域，
-    不含任何透明留白。
+    用 ImageMagick 的 %@（trim 包围盒）。透传 PNG 的四角是透明的，
+    得到的就是字形占据的区域，不含透明留白。
+
+    alpha_pct > 0 时先把 alpha 通道按该百分比二值化再求包围盒，用于
+    忽略抗锯齿的极淡尾巴——那些像素对视觉几乎无贡献，却会把"墨迹底"
+    往下推几个像素，进而让终端多算一整行（底部凭空多出空白）。
     读不到时返回 (0, 0, 0, 0)。
     """
-    r = subprocess.run([MAGICK, png, "-format", "%@", "info:"],
-                       capture_output=True, text=True, timeout=120)
+    if alpha_pct > 0:
+        cmd = [MAGICK, png, "-alpha", "extract",
+               "-threshold", "%d%%" % alpha_pct, "-format", "%@", "info:"]
+    else:
+        cmd = [MAGICK, png, "-format", "%@", "info:"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         return (0, 0, 0, 0)
     m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", r.stdout.strip())
@@ -1070,7 +1077,7 @@ def resize_for_terminal(png: str, target_w: int | None = None,
         # 因为上限恒 >= 字形底边），比上限矮就补到 上限 与 原高+2 的较小值。
         cell_h = int(round(cell_h_px))
         if cell_h > 0:
-            iw, ih, ix, iy = _ink_bbox(png)
+            iw, ih, ix, iy = _ink_bbox(png, alpha_pct=50)
             if ih > 0 and iy + ih <= h:
                 ink_bottom = iy + ih          # 字形底边（不含的下一行）
                 rows = -(-ink_bottom // cell_h)
