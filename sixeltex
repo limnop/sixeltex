@@ -1117,10 +1117,22 @@ def resize_for_terminal(png: str, target_w: int | None = None,
                                 timeout=300, check=True)
                             png, h = squashed, new_h
                             rows, limit = rows - 1, lower
+                            # 压缩后再确认墨迹没被截断
+                            _iw3, _ih3, _ix3, _iy3 = _ink_bbox(png, alpha_pct=50)
+                            if _ih3 > 0:
+                                limit = max(limit, _iy3 + _ih3)
+                                rows = -(-limit // cell_h)
+                                limit = rows * cell_h
 
                 # 填到行边界：图像正好占满整行，终端推进后不会在图像
                 # 之外再留半行；这段填充是透明的，视觉上就是行间距本身。
                 want = limit
+                if want < h:
+                    # 安全校验：再量一次墨迹底，绝不裁到实体墨迹。
+                    # 位置与阈值任何一处算错都可能整行丢失，这里兜住。
+                    _iw2, _ih2, _ix2, _iy2 = _ink_bbox(png, alpha_pct=50)
+                    if _ih2 > 0 and _iy2 + _ih2 > want:
+                        want = _iy2 + _ih2
                 if want < h:
                     # 裁掉超出的透明底边
                     cropped = os.path.join(work, "sixeltex-tight.png")
