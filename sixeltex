@@ -1100,11 +1100,64 @@ def _strip_icat_filename_prefix(data: bytes) -> bytes:
     return data
 
 
+def _go_style_arch() -> str:
+    r"""
+    把本机架构换算成 Go 的 GOARCH 命名（vendor 目录用的是这套）。
+
+    uname 的 machine 名与 Go 的 GOARCH 名不一致，必须显式映射：
+      x86_64 -> amd64      aarch64/arm64 -> arm64
+    未知架构返回空串，此时 _project_icat_candidates() 的候选路径
+    会指向不存在的目录，由调用处的 os.path.isfile 判掉，不会误用。
+    """
+    try:
+        machine = os.uname().machine
+    except (AttributeError, OSError):
+        return ""
+    return {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(machine, "")
+
+
+def _project_icat_candidates() -> list[str]:
+    r"""
+    列出随本仓库分发的 icat 启动脚本候选路径（按平台）。
+
+    icat 是动态链接的第三方二进制，依赖的 .so 收在 vendor/icat/<平台>/lib/ 下，
+    必须经同目录的 run 脚本启动（由它设置 LD_LIBRARY_PATH），不能直接跑 bin/icat。
+
+    路径相对本脚本位置推导，因此不依赖当前工作目录，也不依赖安装位置。
+    平台目录名格式为 <GOOS>-<GOARCH>，如 linux-amd64。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if sys.platform.startswith("linux"):
+        goos = "linux"
+    elif sys.platform == "darwin":
+        goos = "darwin"
+    elif sys.platform.startswith("win"):
+        goos = "windows"
+    else:
+        return []
+    arch = _go_style_arch()
+    if not arch:
+        return []
+    root = os.path.join(here, "vendor", "icat", "%s-%s" % (goos, arch))
+    return [os.path.join(root, "run")]
+
+
 def _icat_path() -> str | None:
     r"""
-    定位 icat。优先 PATH，再回退到常见安装目录
-    （Go 的 `go install` 默认落在 ~/go/bin，该目录常不在 PATH 里）。
+    定位 icat。顺序：仓库自带 -> PATH -> 常见安装目录。
+
+    仓库自带优先，是为了 clone 下来即可用、不要求使用者额外装 icat；
+    若使用者已在 PATH 里装了 icat，也会被下面第二个分支接住。
+    （Go 的 `go install` 默认落在 ~/go/bin，该目录常不在 PATH 里。）
     """
+    for cand in _project_icat_candidates():
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     found = shutil.which("icat")
     if found:
         return found

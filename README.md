@@ -12,11 +12,11 @@
 
 ## 安装
 
-只需两步：确认依赖就位，把脚本放进 `$PATH`。
+只需两步：确认系统依赖就位，把脚本放进 `$PATH`。
 
 ```bash
-# 1. 检查依赖（缺哪个装哪个）
-command -v xelatex gs pdftocairo magick
+# 1. 检查依赖（缺哪个装哪个）。icat 不必装，已随项目分发
+command -v xelatex gs pdftocairo pdftotext pdfinfo magick
 
 # 2. 安装
 install -m 755 sixeltex ~/.local/bin/sixeltex
@@ -28,6 +28,10 @@ sixeltex '\frac{1}{1+x}'
 `~/.local/bin` 通常已在 `$PATH` 里。如果没有，改成 `sudo install -m 755 sixeltex /usr/local/bin/`。
 
 Python 仅需标准库（3.9+ 即可），不需要 pip 安装任何包。
+
+> `install` 只复制脚本本身，`vendor/` 目录留在仓库里即可被找到——
+> `sixeltex` 按自身所在路径推导 `vendor/icat/` 的位置，不依赖当前工作目录。
+> 若你把脚本单独拷到别的机器而没带 `vendor/`，它会回退到 PATH 中查找 `icat`。
 
 ---
 
@@ -223,16 +227,46 @@ OSC 探测要求 stdin/stdout 都是 TTY。在管道、重定向、无终端环�
 
 启动时会逐一 `shutil.which` 确认，任一缺失立即报错退出，不静默兜底。
 
-| 组件 | 用途 |
-|---|---|
-| `xelatex` | 编译（XeTeX，支持 fontspec/xeCJK） |
-| `gs` (Ghostscript) | 算内容 bounding box、裁剪 |
-| `pdftocairo` (Poppler) | PDF → 透明 PNG |
-| `pdftotext` (Poppler) | 提取字符级边界（防止裁掉字形） |
-| `pdfinfo` (Poppler) | 读取页面尺寸 |
-| `magick` (ImageMagick) | 合成背景色、超采样缩放、读取像素 |
-| `icat` | 把最终图片按 sixel 协议输出到终端（默认路径必需） |
-| LaTeX 宏包 | `ctex`, `amsmath`, `amssymb`, `xcolor`, `unicode-math`, `graphicx`, `geometry` |
+| 组件 | 用途 | 获取方式 |
+|---|---|---|
+| `xelatex` | 编译（XeTeX，支持 fontspec/xeCJK） | 系统安装 TeX Live |
+| `gs` (Ghostscript) | 算内容 bounding box、裁剪 | 系统安装 |
+| `pdftocairo` (Poppler) | PDF → 透明 PNG | 系统安装 |
+| `pdftotext` (Poppler) | 提取字符级边界（防止裁掉字形） | 系统安装 |
+| `pdfinfo` (Poppler) | 读取页面尺寸 | 系统安装 |
+| `magick` (ImageMagick) | 合成背景色、超采样缩放、读取像素 | 系统安装（IM6/IM7 均可，自动识别命令名） |
+| `icat` | 把最终图片按 sixel 协议输出到终端 | **随项目分发**（见下） |
+| LaTeX 宏包 | `ctex`, `amsmath`, `amssymb`, `xcolor`, `unicode-math`, `graphicx`, `geometry` | 随 TeX Live |
+
+### icat 已随项目分发
+
+`icat` 及其全部运行时依赖放在 `vendor/icat/<平台>/` 下，**clone 下来即可用，
+无需另行安装**：
+
+```
+vendor/icat/linux-amd64/
+├── bin/icat      动态链接的 icat 二进制（已 strip）
+├── lib/          它依赖的全部 .so（含 libvips）
+├── run           启动脚本：设置 LD_LIBRARY_PATH 后 exec icat
+└── LICENSE       MIT 许可证原文（上游 clayrisser/icat，Copyright (c) 2015-2025 Kenneth Shaw）
+```
+
+`sixeltex` 的查找顺序是：**仓库自带 → PATH → 常见安装目录**。
+也就是说你在 PATH 里装了自己的 icat 时，以仓库自带的为准；
+若删掉 `vendor/` 目录，则自动回退到 PATH 或常见目录中的 icat。
+
+> **为什么必须是动态链接**：上游 `build.sh -s` 支持全静态编译，但需要
+> `libvips.a`，而多数发行版只提供 `libvips.so`，静态构建会以
+> `ld: 找不到 -lvips` 失败。因此采用"二进制 + 依赖库 + run 脚本"的布局。
+>
+> **为什么不能直接跑 `bin/icat`**：它的 `libvips` 等依赖在 `lib/` 下，
+> 不经 `run` 脚本设置 `LD_LIBRARY_PATH` 会找不到库。请始终通过 `run` 启动。
+
+`run` 脚本只在子进程环境里追加 `lib/`，不导出到你的 shell，因此不会影响
+同一会话里的其它程序。
+
+其它平台（macOS / Windows / arm64）目前没有随仓库分发，会回退到在 PATH 中
+查找 `icat`；找不到时会明确报错并提示安装。
 
 ---
 

@@ -1,0 +1,22 @@
+#!/bin/sh
+# 启动随项目分发的 icat。
+#
+# 这个 icat 是动态链接的（上游 build.sh 的 -s 全静态编译需要 libvips.a，
+# 多数发行版只提供 libvips.so，故静态构建不可行）。运行时依赖的 .so
+# 全部收在同级 lib/ 下，通过 LD_LIBRARY_PATH 指向它。
+#
+# 只在本次进程的环境里追加 lib/，不导出到调用者的 shell：
+#   LD_LIBRARY_PATH=... exec icat
+# 而不是 export 后再跑，否则同一 shell 里后续命令也会被影响。
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# 追加而非覆盖：保留调用者已有的 LD_LIBRARY_PATH（若有）。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    LD_LIBRARY_PATH="$HERE/lib:$LD_LIBRARY_PATH"
+else
+    LD_LIBRARY_PATH="$HERE/lib"
+fi
+
+exec env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" "$HERE/bin/icat" "$@"
