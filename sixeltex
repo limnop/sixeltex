@@ -428,6 +428,14 @@ def detect_bg() -> str:
 # 实测不准时用 -W 覆盖。
 DEFAULT_CELL_W_PX = 8.0
 
+# 一个 LaTeX em(中文字宽) 占几个终端字符格。
+#
+# 2.0 表示"一个中文字正好占两个终端列"，与终端文字列宽严格对齐；
+# 但那样正文的字面会略大于终端字体（终端字符格通常比 1/2 em 高），
+# 看起来"公式比终端字大"。取 1.8 让正文略小一号，视觉上与终端字号
+# 更接近；同时每行能多排一些字。
+EM_CELLS = 1.8
+
 
 def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
     r"""
@@ -527,13 +535,13 @@ def build_width_setup(columns: int, enabled: bool = True) -> tuple[str, str]:
     """
     if not enabled or columns is None or columns <= 0:
         return "", ""
-    halfwidth_units = columns / 2.0
+    em_units = columns / EM_CELLS
     setup = (
         r"\newdimen\SixeltexWidth"
         "\n"
         r"\setbox0=\hbox{中}"
         "\n"
-        r"\SixeltexWidth=%.4f\wd0" % halfwidth_units
+        r"\SixeltexWidth=%.4f\wd0" % em_units
     )
     prefix = r"\parbox{\SixeltexWidth}{\raggedright " 
     return setup, prefix
@@ -941,7 +949,9 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
 
 def resize_for_terminal(png: str, target_w: int | None = None,
                         supersample: int = 1,
-                        colors: int | None = None) -> str:
+                        colors: int | None = None,
+                        cell_h_px: float | None = None,
+                        transparent: bool = False) -> str:
     r"""
     把高 DPI 渲染出的 PNG 缩到终端像素尺寸，并对齐 sixel 条带高度。
 
@@ -984,15 +994,39 @@ def resize_for_terminal(png: str, target_w: int | None = None,
             timeout=300, check=True)
         png, w, h = scaled, new_w, new_h
 
-    # 底部安全留白 + 对齐 6 的倍数，一次 splice 完成。
-    # 为什么还要额外留白：PDF 侧的 pad_pt 经超采样缩放后可能只剩几像素，
-    # 而 sixel 是逐像素位图、终端按 1:1 绘制，末行降部一旦贴边就可能被
-    # 截掉（实测不同 DPI/列宽下余量会从 6px 缩到 1px）。这里在像素空间
-    # 再保 4px，与 PDF 侧留白叠加，确保末行永远不贴边。
+    # 底部留白，要同时满足两件事：
+    #
+    # 1) 留够空隙，别让末行降部贴边。PDF 侧的 pad_pt 经超采样缩小后可能
+    #    只剩 1px，故这里在像素空间再补几像素。
+    #
+    # 2) 不要让图像高度跨到下一个终端行，否则终端会为那一条窄带多推进
+    #    一整行，看起来就是末尾凭空多出一个空行。
+    #    终端按 ceil(图像高 / 字符格高) 推进行数，所以要压在
+    #    ceil(h / cell_h) * cell_h 之内。
+    #
+    # 优先对齐到 6 的倍数（sixel 条带整齐）；若那个高度会越过行边界，
+    # 就退让到行边界本身——透传模式(P2=1)下末带没填满的行本来就是透明的，
+    # 不对齐 6 也不会出现异色带。
     BOTTOM_MARGIN_PX = 4
-    pad = (-h) % 6
-    total = pad + BOTTOM_MARGIN_PX
-    if total:
+    target = h + BOTTOM_MARGIN_PX
+    limit = None
+    if cell_h_px and cell_h_px >= 1:
+        cell_h = int(round(cell_h_px))
+        if cell_h > 0:
+            rows = -(-h // cell_h)            # 内容自身占几行
+            limit = rows * cell_h             # 不越行的最大高度
+    if limit is not None and limit >= h:
+        cand = -(-target // 6) * 6            # >= target 的最小 6 倍数
+        total = min(cand, limit) - h
+    else:
+        total = (-(-target // 6) * 6) - h
+
+    # 内容高度正好顶满整数行时，行边界内已无空隙。此时宁可多占一行，
+    # 也不能让末行降部贴边被切。
+    if total <= 0:
+        total = BOTTOM_MARGIN_PX
+
+    if total > 0:
         padded = os.path.join(work, "sixeltex-padded.png")
         subprocess.run(
             [MAGICK, png, "-background", "none",
@@ -1492,7 +1526,7 @@ def render(text: str, args: argparse.Namespace) -> None:
     # 一列 = 半个中文字宽 = fontsize/2 pt，故列数/2 * fontsize。
     # 高度留足够大，上下再按内容裁剪。
     if not args.no_wrap:
-        paper_w = (columns / 2.0) * fontsize
+        paper_w = (columns / EM_CELLS) * fontsize
         fields["paper_w"] = "%.3fpt" % paper_w
         # 页面高度按输入长度估算，避免内容分页后被 -singlefile 丢掉
         fields["paper_h"] = "%.3fpt" % max(
@@ -1569,7 +1603,9 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 否则 high-DPI 原图会被终端强行压缩而失真。
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
-                                      colors=args.colors)
+                                      colors=args.colors,
+                                      cell_h_px=_CELL_H_PX,
+                                      transparent=True)
             if args.margin and args.margin > 0:
                 bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
                 subprocess.run(
@@ -1592,7 +1628,9 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
-                                      colors=args.colors)
+                                      colors=args.colors,
+                                      cell_h_px=_CELL_H_PX,
+                                      transparent=False)
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
             composite_bg(png, bg, final, args.margin)
             # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）

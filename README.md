@@ -145,11 +145,13 @@ sixel 协议本身没有 alpha 通道，实现方式是把 DCS 的 **P2 参数�
 
 **1. 排版层限宽并折行**
 
-一列 = 半个中文字宽（西文占 1 列、中文占 2 列），
-所以可用文本宽 = `列数 / 2` 个中文字宽：
+可用文本宽 = `列数 / EM_CELLS` 个中文字宽。`EM_CELLS`（默认 **1.8**）
+表示"一个中文字占几个终端字符格"：取 2.0 时中文字正好占两列、与终端
+文字严格对齐，但字面会略大于终端字体；取 1.8 让正文小一号，视觉上与
+终端字号更接近，每行也能多排几个字。
 
 ```latex
-\setbox0=\hbox{中}\SixeltexWidth=40\wd0    % 80 列
+\setbox0=\hbox{中}\SixeltexWidth=44\wd0    % 80 列 / 1.8
 \parbox{\SixeltexWidth}{...}                    % 超宽自动折行
 ```
 
@@ -162,6 +164,9 @@ $$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 
 列数被约掉了——**DPI 只取决于字符格宽和字号**。
 字号 10pt、cell_w 8px 时 DPI 自动算为 115。
+
+> 注意最终字面大小其实由 `EM_CELLS × cell_w` 决定（DPI 与字号会互相
+> 约掉），所以想调大调小改 `EM_CELLS`，改 `-s` 只影响 LaTeX 排版比例。
 
 这正是之前“长了接近一倍”的原因：固定 DPI=200 把本应占 640px 的
 80 列内容渲染成 1103px，约占 138 列。
@@ -388,7 +393,8 @@ sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
 ## 已知限制
 
 - **终端需支持 sixel**。可用性见 [arewesixelyet.com](https://www.arewesixelyet.com)。
-- **字符格宽默认 8px**。你的终端缩放不是 100% 时，用 `-W` 调整（见上文）。
+- **字符格宽默认 8px**，但会优先用 CSI 14t/18t 探测到的实际值。终端缩放不是 100% 时用 `-W` 强制指定（见上文）。
+- **末尾不会多出空行**：图像高度会压在 `ceil(内容高 / 字符格高) × 字符格高` 之内，避免终端为一条窄带多推进一整行。
 - **字号探测依赖 `CSI 14t`/`CSI 18t`**。终端不响应时回退 10pt，也可用 `-s` 手动指定。
 - **Sixel 无 alpha 通道**。默认用 DCS 的 P2=1 让终端保留空像素（透传），需要固定底色时用 `--opaque`。透传模式的字形边缘靠"混到背景色"来模拟 alpha，因此 `-b` 在透传下仍会影响边缘观感。
 
