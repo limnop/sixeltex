@@ -1348,9 +1348,14 @@ def render(text: str, args: argparse.Namespace) -> None:
     if args.math_font:
         fields["math_font"] = args.math_font
 
-    # 颜色：命令行优先，否则探测
+    # 颜色：命令行优先，否则探测。
+    # 透传模式下背景色根本不用写进输出，故跳过 OSC 11 查询——
+    # 那是几百毫秒的等待，白花。
     fg = args.color if args.color else detect_fg()
-    bg = args.bgcolor if args.bgcolor else detect_bg()
+    if args.transparent:
+        bg = args.bgcolor or DEFAULT_BG
+    else:
+        bg = args.bgcolor if args.bgcolor else detect_bg()
 
     # 两层字号，不可混淆：
     #   终端字号  —— 探测得到，只用于算 DPI（结果经 _CELL_H_PX 传递）
@@ -1419,7 +1424,9 @@ def render(text: str, args: argparse.Namespace) -> None:
     if args.verbose:
         sys.stderr.write(
             "sixeltex: 模式=%s 前景=%s 背景=%s dpi=%d 字号=%.2fpt 终端=%d列%s\n"
-            % (mode, fg, bg, dpi, fontsize, columns,
+            % (mode, fg,
+               "透传(不写色)" if args.transparent else bg,
+               dpi, fontsize, columns,
                " 透传" if args.transparent else " 合成背景"))
 
     if args.dry_run:
@@ -1442,8 +1449,9 @@ def render(text: str, args: argparse.Namespace) -> None:
             target_w = int(round(columns * cell))
 
         if args.transparent:
-            # 透传模式：只画字形像素，背景不写色（DCS 的 P2=1）。
-            # 与默认路径同样需要先缩到终端像素尺寸并对齐 6 行条带。
+            # 默认路径：只画字形像素，背景不写色（DCS 的 P2=1）。
+            # 同样需要先缩到终端像素尺寸并对齐 6 行条带，
+            # 否则 high-DPI 原图会被终端强行压缩而失真。
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
                                       colors=args.colors)
@@ -1521,7 +1529,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--color", default=None,
                    help="前景色，命名色或 #RRGGBB。默认 OSC 探测终端色")
     p.add_argument("-b", "--bgcolor", default=None,
-                   help="背景色。默认 OSC 探测；此为合到底色，非 LaTeX 页面背景")
+                   help="背景色，仅在 --opaque 下生效（此为合到底色，"
+                        "非 LaTeX 页面背景）。透传模式不使用此参数")
     p.add_argument("-m", "--margin", type=int, default=0,
                    help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
     p.add_argument("-S", "--math-scale", dest="math_scale", type=float,
@@ -1546,9 +1555,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="西文字体名")
     p.add_argument("-M", "--math-font", dest="math_font", default=None,
                    help="数学字体名（需带 MATH 表）")
-    p.add_argument("--transparent", action="store_true",
-                   help="透传背景：只画字形像素，背景不写色，让终端原样透出。"
-                        "默认是把结果合成到 -b/探测到的背景色")
+    bg_mode = p.add_mutually_exclusive_group()
+    bg_mode.add_argument("--transparent", dest="transparent",
+                         action="store_true", default=True,
+                         help="透传背景（默认）：只画字形像素，背景不写色，"
+                              "终端原有背景/壁纸原样透出。DCS 用 P2=1 告知终端")
+    bg_mode.add_argument("--opaque", dest="transparent", action="store_false",
+                         help="不透明模式：把透明渲染结果合成到 -b/探测到的"
+                              "背景色上。用于不支持 P2=1 的老终端，或需要"
+                              "固定底色的场合")
     p.add_argument("--no-wrap", action="store_true",
                    help="关闭按终端列宽自动折行（默认按探测到的列数限制排版宽度）")
     p.add_argument("--crop-width", action="store_true",

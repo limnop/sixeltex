@@ -112,23 +112,26 @@ sixeltex ~/文档/论文.tex
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-c`, `--color` | 自动探测 | 前景色，命名色或 `#RRGGBB` |
-| `-b`, `--bgcolor` | 自动探测 | 背景色。默认合成用；`--transparent` 时不生效 |
-| `--transparent` | 关 | 透传背景：只画字形像素，背景不写色。默认是**合成背景色** |
+| `-b`, `--bgcolor` | 自动探测 | 背景色，**仅 `--opaque` 下生效** |
+| `--transparent` | **开**（默认） | 透传背景：只画字形像素，背景不写色 |
+| `--opaque` | 关 | 不透明模式：合成到 `-b`/探测到的背景色 |
 | `-w`, `--width` | 自动探测 | 强制指定终端列数 |
 | `--no-wrap` | 关 | 关闭按列宽折行 |
 
 **颜色解析顺序**：命令行参数 → OSC 10/11 终端探测 → 环境变量 `SIXELTEX_FG` / `SIXELTEX_BG` → 硬编码兜底 `#fcfcfc` / `#232627`。
 
-#### 关于背景色（默认合成）
+#### 背景：默认透传
 
-默认行为：LaTeX 不设页面背景 → pdftocairo -transp 得到带 alpha 的 PNG
-→ 合成到 `-b`/探测到的终端背景色 → 输出 sixel。
+默认行为：LaTeX 不设页面背景 → `pdftocairo -transp` 得到带 alpha 的 PNG
+→ **只编码 alpha>0 的字形像素，背景像素不写色** → 输出 sixel。
 
-这样公式能融入终端配色，不会与终端背景撞色。
+sixel 协议本身没有 alpha 通道，实现方式是把 DCS 的 **P2 参数置 1**
+（`\x1bP0;1;0q`），告诉终端"空像素保持原样"。foot 的 `sixel.c` 即以
+`p2 == 1` 判定透明；支持该参数的终端（foot / kitty / wezterm / contour）
+会把终端的真实背景或壁纸透出来，配合终端自己的半透明+模糊效果正好。
 
-如果你确实需要“背景不写色、让终端原样透出”，用 `--transparent`。
-注意 sixel 协议本身没有 alpha 通道，`--transparent` 的实现是自写编码器
-只编码 alpha>0 的字形像素、背景像素不写色。
+需要固定底色，或终端不认 P2=1（较老的 mintty 等可能显示成黑块），用
+`--opaque`：结果会合成到 `-b` 或 OSC 11 探测到的终端背景色上。
 
 #### 按终端列数自动折行（默认开启）
 
@@ -234,14 +237,15 @@ OSC 探测要求 stdin/stdout 都是 TTY。在管道、重定向、无终端环�
 | `pdftocairo` (Poppler) | PDF → 透明 PNG | 系统安装 |
 | `pdftotext` (Poppler) | 提取字符级边界（防止裁掉字形） | 系统安装 |
 | `pdfinfo` (Poppler) | 读取页面尺寸 | 系统安装 |
-| `magick` (ImageMagick) | 合成背景色、超采样缩放、读取像素 | 系统安装（IM6/IM7 均可，自动识别命令名） |
-| `icat` | 把最终图片按 sixel 协议输出到终端 | **随项目分发**（见下） |
+| `magick` (ImageMagick) | 超采样缩放、量化、读取像素；`--opaque` 下合成背景色 | 系统安装（IM6/IM7 均可，自动识别命令名） |
+| `icat` | 仅 `--opaque` 下用于输出 sixel | **随项目分发**（见下） |
 | LaTeX 宏包 | `ctex`, `amsmath`, `amssymb`, `xcolor`, `unicode-math`, `graphicx`, `geometry` | 随 TeX Live |
 
-### icat 已随项目分发
+### icat 已随项目分发（仅 --opaque 需要）
 
-`icat` 及其全部运行时依赖放在 `vendor/icat/<平台>/` 下，**clone 下来即可用，
-无需另行安装**：
+默认的透传路径走自写编码器，**完全不需要 icat**。
+只有 `--opaque` 才会用到它。`icat` 及其全部运行时依赖放在
+`vendor/icat/<平台>/` 下，clone 下来即可用，无需另行安装：
 
 ```
 vendor/icat/linux-amd64/
@@ -323,8 +327,9 @@ sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
 输入 → 模式判定 → 模板组装 → xelatex 编译 → PDF
   → gs 算 bbox 写 CropBox → 裁剪
   → pdftocairo -transp → 透明 PNG
-  → magick 合成背景色
-  → magick sixel:- → stdout
+  → magick 缩到终端像素尺寸（超采样 + 量化）
+  → 自写编码器（P2=1）→ stdout          [默认：透传]
+  或 magick 合成背景色 → icat            [--opaque]
 ```
 
 ### 两个关键实现细节
@@ -355,7 +360,7 @@ sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
 | `gs`（Ghostscript） | 计算矢量内容边界、写 CropBox |
 | `pdftocairo` / `pdftoppm`（Poppler） | PDF → 透明 PNG |
 | `pdftotext`（Poppler） | 提取字符级边界 |
-| `magick`（ImageMagick） | 合成背景色、sixel 编码 |
+| `magick`（ImageMagick） | 超采样缩放、量化、合成背景色（--opaque） |
 
 LaTeX 宏包：`ctex` `amsmath` `amssymb` `xcolor` `unicode-math` `graphicx` `geometry`。
 
@@ -371,7 +376,7 @@ sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
 - **终端需支持 sixel**。可用性见 [arewesixelyet.com](https://www.arewesixelyet.com)。
 - **字符格宽默认 8px**。你的终端缩放不是 100% 时，用 `-W` 调整（见上文）。
 - **字号探测依赖 `CSI 14t`/`CSI 18t`**。终端不响应时回退 10pt，也可用 `-s` 手动指定。
-- **Sixel 无 alpha 通道**。默认把结果合成到探测到的终端背景色上；`--transparent` 可改为只画字形像素。
+- **Sixel 无 alpha 通道**。默认用 DCS 的 P2=1 让终端保留空像素（透传），需要固定底色时用 `--opaque`。
 
 ## 排查
 
