@@ -106,7 +106,6 @@ sixeltex ~/文档/论文.tex
 | `-d`, `--dpi` | 自动反算 | 光栅化 DPI。默认按 `-W` 与字号反算，使内容恰好占满列数 |
 | `-W`, `--cell-width` | `8` | 终端一个字符格的像素宽，决定图占多少列 |
 | `-m`, `--margin` | `0` | 四周额外留白(像素)。内容边界由 ghostscript 自动算，通常不需要手动留白 |
-| `--sacrifice-rows` | `1` | 预备牺牲行数：图像底部多渲染 N 个终端行高的透明垫背，终端空间不足时先裁这些空白 |
 
 ### 颜色
 
@@ -146,13 +145,13 @@ sixel 协议本身没有 alpha 通道，实现方式是把 DCS 的 **P2 参数�
 
 **1. 排版层限宽并折行**
 
-可用文本宽 = `列数 / EM_CELLS` 个中文字宽。`EM_CELLS`（默认 **1.8**）
+可用文本宽 = `列数 / EM_CELLS` 个中文字宽。`EM_CELLS`（默认 **1.65**）
 表示"一个中文字占几个终端字符格"：取 2.0 时中文字正好占两列、与终端
-文字严格对齐，但字面会略大于终端字体；取 1.8 让正文小一号，视觉上与
+文字严格对齐，但字面会略大于终端字体；取 1.65 让正文小一号，视觉上与
 终端字号更接近，每行也能多排几个字。
 
 ```latex
-\setbox0=\hbox{中}\SixeltexWidth=44\wd0    % 80 列 / 1.8
+\setbox0=\hbox{中}\SixeltexWidth=48\wd0    % 80 列 / 1.65
 \parbox{\SixeltexWidth}{...}                    % 超宽自动折行
 ```
 
@@ -174,8 +173,9 @@ $$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 | 常量 | 默认 | 作用 |
 |---|---|---|
 | `EM_CELLS` | 1.65 | 一个字占几个字符格，决定字面大小 |
-| `LETTER_SPACE_EM` | 0.06 | 中文字间距（em）。改这个文件里的常量 |
-| `LINE_SPREAD` | 1.15 | `\linespread` 行距倍数，1.0 为 LaTeX 默认 |
+| `LETTER_SPACE_EM` | 0.10 | 中文字间距（em），0 为不加宽 |
+| `LINE_SPREAD` | 1.25 | `\linespread` 行距倍数，1.0 为 LaTeX 默认 |
+| `SAFE_BOTTOM_PAD_ROWS` | 1 | 预备牺牲行数的默认值，可被 `--sacrifice-rows` 覆盖 |
 
 字间距用 `\xeCJKsetup{CJKglue=...}` 实现，**必须放在 `\begin{document}`
 之后**——ctex 进入正文时会重设 CJKglue，放导言区无效。
@@ -209,7 +209,7 @@ $$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 - `--no-wrap`：关闭折行
 - `--crop-width`：左右也按内容裁剪（**默认只裁上下、左右保留整页宽度**）
 
-### 环境与模板### 环境与模板### 环境与模板### 环境与模板
+### 环境与模板
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -240,6 +240,7 @@ $$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 | `-k FILE`, `--keep-png` | 把中间 PNG 另存到指定路径 |
 | `-K`, `--keep-dir` | 保留临时工作目录（含 `.tex`/`.pdf`/`.log`） |
 | `-v`, `--verbose` | 打印模式、颜色、DPI 等诊断信息 |
+| `--sacrifice-rows` | `1` | 预备牺牲行数：图像底部多渲染 N 个终端行高的透明垫背，终端空间不足时先裁这些空白 |
 
 ---
 
@@ -332,21 +333,6 @@ sixeltex -k ~/图片/公式.png '\alpha + \beta = \gamma'
 
 ---
 
-## 排障
-
-| 现象 | 原因与处理 |
-|---|---|
-| `缺少依赖: xxx` | 装对应组件后重试 |
-| `xelatex 编译失败` + 日志尾部 | 看 `-K` 保留目录里的 `xelatex.log`；LaTeX 语法错误会带 `!` 行号和 `l.NN` 出错行 |
-| `警告：检测到 N 个缺字` | 字体不含所需字形，换 `-C` / `-M` / `-L` |
-| `无法解析前景色` | 颜色值不合法，已自动回落默认值 |
-| `字号 Npt 不是 LaTeX 标准档位` | 已归到最接近的 10/11/12pt；要连续缩放用 `-S` |
-| `-C` 报 `unrecognized arguments` | 字体名没加引号，被 shell 拆成多个词 |
-| 输出尺寸不符合预期 | 用 `-n` 看生成的 `.tex`，用 `-k` 看中间 PNG |
-| OSC 颜色探测没生效 | 非 TTY 环境下不会探测，用 `SIXELTEX_FG`/`SIXELTEX_BG` 或 `-c`/`-b` 显式指定 |
-
----
-
 ## 实现要点
 
 ### 渲染管线
@@ -388,25 +374,6 @@ bbox 裁剪。
 
 ---
 
-## 依赖
-
-| 组件 | 用途 |
-|---|---|
-| `xelatex` | LaTeX 编译（XeTeX，支持 fontspec / xeCJK） |
-| `gs`（Ghostscript） | 计算矢量内容边界、写 CropBox |
-| `pdftocairo` / `pdftoppm`（Poppler） | PDF → 透明 PNG |
-| `pdftotext`（Poppler） | 提取字符级边界 |
-| `magick`（ImageMagick） | 超采样缩放、量化、合成背景色（--opaque） |
-
-LaTeX 宏包：`ctex` `amsmath` `amssymb` `xcolor` `unicode-math` `graphicx` `geometry`。
-
-Debian/Ubuntu 下大致是：
-
-```bash
-sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
-                 poppler-utils ghostscript imagemagick
-```
-
 ## 已知限制
 
 - **终端需支持 sixel**。可用性见 [arewesixelyet.com](https://www.arewesixelyet.com)。
@@ -415,14 +382,23 @@ sudo apt install texlive-xetex texlive-lang-chinese texlive-science \
 - **Sixel 无 alpha 通道**。默认用 DCS 的 P2=1 让终端保留空像素（透传），需要固定底色时用 `--opaque`。透传模式的字形边缘靠"混到背景色"来模拟 alpha，因此 `-b` 在透传下仍会影响边缘观感。
 - **终端空间不足时底部会被裁**。sixel 图像从光标处向下画，终端不会为它滚动，剩余行数不足时超出窗口的部分被直接裁掉。内容在图像顶部，被裁的永远是底部；因此 sixeltex 在图像底部预留若干「预备牺牲行」（`--sacrifice-rows`，默认 1）当垫背，空间不够时先吃掉这些空白，正文不受影响。代价是正常排版时底部也会多出这几行空白；裁切超过预留行数就会碰到正文，调大该参数可覆盖更极端的窗口高度，设为 0 即不预留。
 
-## 排查
+## 排障
 
-| 现象 | 处理 |
+| 现象 | 原因与处理 |
 |---|---|
+| `缺少依赖: xxx` | 装对应组件后重试 |
+| `xelatex 编译失败` + 日志尾部 | 看 `-K` 保留目录里的 `xelatex.log`；LaTeX 语法错误会带 `!` 行号和 `l.NN` 出错行 |
+| `警告：检测到 N 个缺字` | 字体不含所需字形，换 `-C` / `-M` / `-L` |
+| `无法解析前景色` | 颜色值不合法，已自动回落默认值 |
+| `字号 Npt 不是 LaTeX 标准档位` | 已归到最接近的 10/11/12pt；要连续缩放用 `-S` |
+| `-C` 报 `unrecognized arguments` | 字体名没加引号，被 shell 拆成多个词 |
+| 输出尺寸不符合预期 | 用 `-n` 看生成的 `.tex`，用 `-k` 看中间 PNG |
+| OSC 颜色探测没生效 | 非 TTY 环境下不会探测，用 `SIXELTEX_FG`/`SIXELTEX_BG` 或 `-c`/`-b` 显式指定 |
 | 输出偏宽/偏窄 | 调整 `-W`（字符格像素宽），或 `-v` 查看探测到的列数 |
 | 中文显示为方块 | 换 `-C` 指定一个实际存在的中文字体（`fc-list :lang=zh family` 可查） |
-| 编译失败 | `-K` 保留工作目录，查看 `xelatex.log` |
 | 输出一片空白 | 确认终端支持 sixel；`-k out.png` 导出 PNG 验证内容本身是否正常 |
+| 底部内容被裁掉 | 终端空间不足且未预留垫背：调大 `--sacrifice-rows`（如 2~3），或放大终端窗口 |
+| 底部空白过多 | 调小 `--sacrifice-rows`，设 0 则完全不预留 |
 
 ## 许可证
 
