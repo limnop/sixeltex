@@ -168,6 +168,21 @@ $$\mathrm{DPI} = \frac{2 \times \mathrm{cell\_w} \times 72}{\mathrm{fontsize}}$$
 > 注意最终字面大小其实由 `EM_CELLS × cell_w` 决定（DPI 与字号会互相
 > 约掉），所以想调大调小改 `EM_CELLS`，改 `-s` 只影响 LaTeX 排版比例。
 
+**3. 字间距与行距**
+
+| 常量 | 默认 | 作用 |
+|---|---|---|
+| `EM_CELLS` | 1.65 | 一个字占几个字符格，决定字面大小 |
+| `LETTER_SPACE_EM` | 0.06 | 中文字间距（em）。改这个文件里的常量 |
+| `LINE_SPREAD` | 1.15 | `\linespread` 行距倍数，1.0 为 LaTeX 默认 |
+
+字间距用 `\xeCJKsetup{CJKglue=...}` 实现，**必须放在 `\begin{document}`
+之后**——ctex 进入正文时会重设 CJKglue，放导言区无效。
+
+行距对底部留白有影响：终端按 `ceil(图像高 / 字符格高)` 推进行数，
+行距调大让墨迹更靠近行边界，余量反而变小；但调到越过下一个行边界
+就会突然多占一整行。
+
 这正是之前“长了接近一倍”的原因：固定 DPI=200 把本应占 640px 的
 80 列内容渲染成 1103px，约占 138 列。
 

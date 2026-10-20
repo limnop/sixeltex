@@ -45,6 +45,7 @@ TEMPLATE = r"""\documentclass[UTF8,fontset=none,{class_opts}]{{{doc_class}}}
 {extra_packages}
 {preamble_extra}
 \pagestyle{{empty}}
+\linespread{{{line_spread}}}
 {font_setup}
 {color_setup}
 \begin{{document}}
@@ -75,6 +76,8 @@ DEFAULTS = {
     "color_setup": "",
     # 宽度设置。空串时由 build_width_setup() 按终端列数生成
     "width_setup": "",
+    # 行距倍数
+    "line_spread": "1.0",
     # 中文字间距（必须在正文里设置：ctex 在 \begin{document} 时会
     # 重置 CJKglue，放导言区无效）
     "cjk_glue": "",
@@ -443,6 +446,11 @@ EM_CELLS = 1.65
 # 中文字间距（em）。0 表示不额外加宽；ctex/xeCJK 默认的 CJKglue 让汉字
 # 紧贴在一起，密集段落会显得很挤，加一点点空隙更易读。
 LETTER_SPACE_EM = 0.06
+
+# 行距倍数（\linespread）。1.0 = LaTeX 默认（ctexart 10pt 下约 12pt）。
+# 注意：这个值直接决定行间距，与字号无关；调大只是把行与行拉开，
+# 字形大小不变。
+LINE_SPREAD = 1.15
 
 
 def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
@@ -1618,6 +1626,7 @@ def render(text: str, args: argparse.Namespace) -> None:
 
     fields["font_setup"] = build_font_setup(fields)
     fields["cjk_glue"] = build_cjk_glue()
+    fields["line_spread"] = "%.3f" % LINE_SPREAD
     fields["color_setup"] = build_color_setup(fields, fg, bg)
 
     # 输入模式判定
