@@ -903,26 +903,29 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
     return png
 
 
-def composite_bg(png: str, bg: str, out: str, margin: int = 0,
-                 target_w: int | None = None,
-                 supersample: int = 1) -> str:
+def resize_for_terminal(png: str, target_w: int | None = None,
+                        supersample: int = 1) -> str:
     r"""
-    合成背景色，同时做超采样缩小与高度对齐。
+    把高 DPI 渲染出的 PNG 缩到终端像素尺寸，并对齐 sixel 条带高度。
+
+    两步都做，缺一不可：
 
     1. 超采样缩小（解决"发糊"）
-       高 DPI 渲染的图先用 Lanczos 缩到目标宽度，再量化到 256 色。
-       比直接按目标 DPI 渲染的取样密度高，字形边缘更锐利。
+       LaTeX 按 base_dpi * supersample 渲染，得到远大于终端像素的图。
+       若直接把这张图编码成 sixel，终端会强行压缩到列宽，导致失真。
+       先用 Lanczos 缩到目标宽度（列数 * 字符格宽），
+       等效于高质量抗锯齿，比直接按目标 DPI 渲染取样密度高。
 
     2. 底部补透明像素到 6 的倍数（解决"黑带"）
        sixel 每 6 行一个带，高度非 6 倍数时最后一个带不满，
-       终端填充条带剩余部分，视觉上出现黑带。
+       终端会用背景色填充剩余部分，视觉上出现一条异色带。
+       补在底部（-gravity south）而非顶部，避免把内容往下推。
 
-    3. 合成背景色：-background 铺满透明像素。
+    保留 alpha 通道——由调用方决定是否合成背景色。
     """
     work = os.path.dirname(png)
-
-    # --- 1. 超采样缩小 ---
     w, h = _image_size(png)
+
     if supersample and supersample > 1:
         if target_w and target_w > 0 and w > target_w:
             new_w = target_w
@@ -938,7 +941,6 @@ def composite_bg(png: str, bg: str, out: str, margin: int = 0,
             timeout=300, check=True)
         png, w, h = scaled, new_w, new_h
 
-    # --- 2. 底部补到 6 的倍数 ---
     pad = (-h) % 6
     if pad:
         padded = os.path.join(work, "sixeltex-padded.png")
@@ -949,7 +951,17 @@ def composite_bg(png: str, bg: str, out: str, margin: int = 0,
             timeout=300, check=True)
         png, h = padded, h + pad
 
-    # --- 3. 留白 + 合成背景色 ---
+    return png
+
+
+def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
+    r"""
+    合成背景色：把透明 PNG 铺到指定背景色上，得到不透明图。
+
+    超采样缩小与高度对齐已由 resize_for_terminal() 完成，
+    这里只负责最后一步"把 alpha 抹掉、烧成实色"。
+    """
+    # --- 留白 + 合成背景色 ---
     cmd = [MAGICK, png]
     if margin and margin > 0:
         cmd += ["-bordercolor", "transparent", "-border", str(margin)]
@@ -1331,8 +1343,18 @@ def render(text: str, args: argparse.Namespace) -> None:
         png = pdf_to_transparent_png(pdf, workdir_ctx, dpi)
 
 
+        # 目标宽度 = 终端列数 * 字符格宽(px)，超采样后缩回这个尺寸。
+        # 两条路径共用：不缩放的话，sixel 图会被终端强行压缩到列宽而失真。
+        target_w = None
+        if not args.no_wrap and not args.dpi:
+            cell = _CELL_W_PX if _CELL_W_PX else DEFAULT_CELL_W_PX
+            target_w = int(round(columns * cell))
+
         if args.transparent:
-            # 透传模式（需显式开启）：只画字形像素，背景不写色
+            # 透传模式：只画字形像素，背景不写色（DCS 的 P2=1）。
+            # 与默认路径同样需要先缩到终端像素尺寸并对齐 6 行条带。
+            png = resize_for_terminal(png, target_w=target_w,
+                                      supersample=supersample)
             if args.margin and args.margin > 0:
                 bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
                 subprocess.run(
@@ -1341,17 +1363,18 @@ def render(text: str, args: argparse.Namespace) -> None:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     timeout=300, check=True)
                 png = bordered
+            # -k 保存"最终要显示的那张图"（已缩放、已补边、仍带 alpha）
+            if args.keep_png:
+                dest = os.path.abspath(args.keep_png)
+                shutil.copyfile(png, dest)
+                sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
             png_to_sixel_transparent(png, fg)
         else:
-            # 默认：把透明渲染结果合成到背景色，避免与终端背景撞色
+            # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
+            png = resize_for_terminal(png, target_w=target_w,
+                                      supersample=supersample)
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
-            # 目标宽度 = 终端列数 * 字符格宽(px)，超采样后缩回这个尺寸
-            target_w = None
-            if not args.no_wrap and not args.dpi:
-                cell = _CELL_W_PX if _CELL_W_PX else DEFAULT_CELL_W_PX
-                target_w = int(round(columns * cell))
-            composite_bg(png, bg, final, args.margin,
-                         target_w=target_w, supersample=supersample)
+            composite_bg(png, bg, final, args.margin)
             # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）
             if args.keep_png:
                 dest = os.path.abspath(args.keep_png)
