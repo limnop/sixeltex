@@ -984,15 +984,22 @@ def resize_for_terminal(png: str, target_w: int | None = None,
             timeout=300, check=True)
         png, w, h = scaled, new_w, new_h
 
+    # 底部安全留白 + 对齐 6 的倍数，一次 splice 完成。
+    # 为什么还要额外留白：PDF 侧的 pad_pt 经超采样缩放后可能只剩几像素，
+    # 而 sixel 是逐像素位图、终端按 1:1 绘制，末行降部一旦贴边就可能被
+    # 截掉（实测不同 DPI/列宽下余量会从 6px 缩到 1px）。这里在像素空间
+    # 再保 4px，与 PDF 侧留白叠加，确保末行永远不贴边。
+    BOTTOM_MARGIN_PX = 4
     pad = (-h) % 6
-    if pad:
+    total = pad + BOTTOM_MARGIN_PX
+    if total:
         padded = os.path.join(work, "sixeltex-padded.png")
         subprocess.run(
             [MAGICK, png, "-background", "none",
-             "-gravity", "south", "-splice", "0x%d" % pad, padded],
+             "-gravity", "south", "-splice", "0x%d" % total, padded],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=300, check=True)
-        png, h = padded, h + pad
+        png, h = padded, h + total
 
     return png
 
@@ -1532,6 +1539,10 @@ def render(text: str, args: argparse.Namespace) -> None:
                "透传(不写色)" if args.transparent else bg,
                dpi, fontsize, columns,
                " 透传" if args.transparent else " 合成背景"))
+        sys.stderr.write(
+            "sixeltex: 字符格 %s x %s px（探测值，None=终端未响应 CSI 查询）\n"
+            % ("%.1f" % _CELL_W_PX if _CELL_W_PX else "None",
+               "%.1f" % _CELL_H_PX if _CELL_H_PX else "None"))
 
     if args.dry_run:
         sys.stderr.write(tex)
@@ -1572,6 +1583,10 @@ def render(text: str, args: argparse.Namespace) -> None:
                 dest = os.path.abspath(args.keep_png)
                 shutil.copyfile(png, dest)
                 sys.stderr.write("sixeltex: PNG 已保存到 %s\n" % dest)
+            if args.verbose:
+                fw, fh = _image_size(png)
+                sys.stderr.write("sixeltex: 输出图像 %dx%d px（含底部留白）\n"
+                                 % (fw, fh))
             png_to_sixel_transparent(png, fg, args.colors, bg)
         else:
             # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
@@ -1589,6 +1604,9 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 图片尺寸本身已按探测到的终端宽度算好，这里只是告诉 icat
             # 按原样显示、不要再缩放（它的自动适配会引入尺寸漂移）。
             final_w, final_h = _image_size(final)
+            if args.verbose:
+                sys.stderr.write("sixeltex: 输出图像 %dx%d px（含底部留白）\n"
+                                 % (final_w, final_h))
             png_to_sixel_opaque(final, args.colors, final_w, final_h)
     finally:
         if args.keep_dir:
