@@ -452,6 +452,18 @@ LETTER_SPACE_EM = 0.10
 # 字形大小不变。
 LINE_SPREAD = 1.25
 
+# 允许的垂直压缩比例上限，用于把图像高度精确对齐到终端行边界。
+#
+# 背景：终端按 ceil(图像高 / 字符格高) 推进行数，所以墨迹底部到下一个
+# 行边界之间必然留一段空白（0 ~ 一整个行高）。而 DCS 头里声明的栅格
+# 高度就是唯一能影响推进量的东西，且 foot 会裁掉超出声明高度的数据
+# （实测：声明 44 写 48 行，超出部分不显示），所以不能"多画少报"。
+#
+# 唯一可行的办法是把图像垂直压一点点，让墨迹正好落进行边界。4% 左右
+# 的压缩在这个字号下肉眼几乎无差别；超过这个比例会明显变扁，故设上限。
+# 设为 0 可完全禁用（保留原始比例，接受底部空白）。
+MAX_VERTICAL_SQUASH = 0.05
+
 
 def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
     r"""
@@ -1082,7 +1094,31 @@ def resize_for_terminal(png: str, target_w: int | None = None,
                 ink_bottom = iy + ih          # 字形底边（不含的下一行）
                 rows = -(-ink_bottom // cell_h)
                 limit = rows * cell_h
-                # 一直填到行边界：图像正好占满整行，终端推进后不会在图像
+
+                # 能少占一行就少占一行：若压缩幅度在上限内，把整幅图
+                # 垂直压到上一档行边界，墨迹底刚好贴住边界，底部空白归零。
+                if rows > 1:
+                    lower = (rows - 1) * cell_h
+                    # 压缩比要以"墨迹高度"为基准：整幅图按 f 缩放后，
+                    # 墨迹也按 f 缩，要让它落到 lower 以内，f <= lower/ink。
+                    # 用图像高度（含透明留白）当分母会严重高估所需压缩量。
+                    if lower >= cell_h and ink_bottom > 0:
+                        ratio = lower / float(ink_bottom)
+                        if 1.0 - ratio <= MAX_VERTICAL_SQUASH:
+                            # 按 f 缩放整幅图（不是直接压到 lower），
+                            # 这样墨迹正好缩到 lower，压缩量才是所需的最小值
+                            new_h = max(1, int(round(h * ratio)))
+                            squashed = os.path.join(work, "sixeltex-squash.png")
+                            subprocess.run(
+                                [MAGICK, png, "-filter", "Lanczos",
+                                 "-resize", "%dx%d!" % (w, new_h), squashed],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=300, check=True)
+                            png, h = squashed, new_h
+                            rows, limit = rows - 1, lower
+
+                # 填到行边界：图像正好占满整行，终端推进后不会在图像
                 # 之外再留半行；这段填充是透明的，视觉上就是行间距本身。
                 want = limit
                 if want < h:
