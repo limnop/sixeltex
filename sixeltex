@@ -1136,20 +1136,31 @@ def encode_transparent_sixel(png: str, fg: str,
             int(round(g * 100 / 255.0)),
             int(round(b * 100 / 255.0)))).encode()
 
-    # 逐条带编码：每个颜色分别编证该条带内的像素位。
-    # 同一像素只属于一个颜色（后写的覆盖先写的），
-    # 因此需覄则"先出现的颜色先编码"以避免相互覆盖。
-    order = []
-    seen = set()
+    # 逐条带编码。
+    #
+    # sixel 的带推进规则决定了换色写法，这里很容易踩坑：
+    #   `-` (DECGNL) 推进到下一带（6 行），
+    #   `$` (DECGCR) 只把当前位置退回本带左端，不推进。
+    # 因此同一带内换色必须用 `$`，只有本带最后一个颜色才用 `-`。
+    # 若对每个颜色都写 `-`，N 个颜色就把光标推进 N*6 行，
+    # 图像会被拉成 N 倍高、各色错行——即"撕裂的点点"。
     for rows in bands:
+        # 只编码本带实际出现的颜色。不在本带出现的颜色整带全空，
+        # 写出去只是一串 `?`，纯属浪费体积。
+        present = []
+        seen_local = set()
         for row in rows:
             for v in row:
-                if v and v not in seen:
-                    seen.add(v)
-                    order.append(v)
+                if v and v not in seen_local:
+                    seen_local.add(v)
+                    present.append(v)
 
-    for rows in bands:
-        for i in order:
+        if not present:
+            # 整带全空：仍需推进 6 行，否则后续内容会错位
+            out += b"-"
+            continue
+
+        for n, i in enumerate(present):
             band = bytearray(w)
             for k in range(6):
                 prow = rows[k]
@@ -1171,7 +1182,9 @@ def encode_transparent_sixel(png: str, fg: str,
                 else:
                     parts.append(ch * cnt)
                 p = q2
-            out += ("#%d" % i).encode() + "".join(parts).encode("ascii") + b"-"
+            out += ("#%d" % i).encode() + "".join(parts).encode("ascii")
+            # 本带还有其它颜色 -> 回车复用本带；已是最后一个 -> 推进
+            out += b"$" if n < len(present) - 1 else b"-"
     out += b"\x1b\\"                            # ST
     return bytes(out)
 
