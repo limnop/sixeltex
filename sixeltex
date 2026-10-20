@@ -452,6 +452,16 @@ LETTER_SPACE_EM = 0.10
 # 字形大小不变。
 LINE_SPREAD = 1.25
 
+# 图像底部额外多渲染几行透明像素（单位：终端行）。
+#
+# 为什么：sixel 图像从光标处向下画，而终端不会为它滚动——剩余行数不足
+# 时，超出窗口底边的部分被直接裁掉。内容位于图像顶部，所以被裁掉的
+# 永远是底部；只要底部有几行"垫背"的空白，裁切就只会吃掉这些空白，
+# 正文毫发无损。代价是排版正常时底部也会多出这几行空白，属已知取舍。
+#
+# 0 表示不预留（旧行为：窗口不够高时末尾内容会被裁掉）。
+SAFE_BOTTOM_PAD_ROWS = 2
+
 
 
 def compute_dpi_for_columns(cell_w_px: float, fontsize_pt: float) -> float:
@@ -982,7 +992,8 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
 
 def resize_for_terminal(png: str, target_w: int | None = None,
                         supersample: int = 1,
-                        colors: int | None = None) -> str:
+                        colors: int | None = None,
+                        extra_bottom_px: int = 0) -> str:
     r"""
     把高 DPI 渲染出的 PNG 缩到终端像素尺寸，并对齐 sixel 条带高度。
 
@@ -1020,17 +1031,33 @@ def resize_for_terminal(png: str, target_w: int | None = None,
             timeout=300, check=True)
         png, w, h = scaled, new_w, new_h
 
-    pad = (-h) % 6
-    if pad:
+    # 底部垫背空白 + 对齐 6 的倍数，一次 splice 完成。
+    # 垫背的那几行是为了在终端空间不足时"代替正文被裁掉"，
+    # 见 SAFE_BOTTOM_PAD_ROWS 的说明。
+    total = max(0, int(extra_bottom_px))
+    total += (-(h + total)) % 6
+    if total:
         padded = os.path.join(work, "sixeltex-padded.png")
         subprocess.run(
             [MAGICK, png, "-background", "none",
-             "-gravity", "south", "-splice", "0x%d" % pad, padded],
+             "-gravity", "south", "-splice", "0x%d" % total, padded],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=300, check=True)
-        png, h = padded, h + pad
+        png, h = padded, h + total
 
     return png
+
+
+def _safe_pad_px() -> int:
+    """
+    底部垫背空白该留多少像素：SAFE_BOTTOM_PAD_ROWS 个终端行高。
+
+    终端行高优先用探测值；拿不到时按 16px 兜底（与 DPI 反算的兜底一致）。
+    """
+    if SAFE_BOTTOM_PAD_ROWS <= 0:
+        return 0
+    cell_h = _CELL_H_PX if _CELL_H_PX else 16.0
+    return int(round(SAFE_BOTTOM_PAD_ROWS * cell_h))
 
 
 def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
@@ -1607,7 +1634,8 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 否则 high-DPI 原图会被终端强行压缩而失真。
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
-                                      colors=args.colors)
+                                      colors=args.colors,
+                                      extra_bottom_px=_safe_pad_px())
             if args.margin and args.margin > 0:
                 bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
                 subprocess.run(
@@ -1630,7 +1658,8 @@ def render(text: str, args: argparse.Namespace) -> None:
             # 默认：先缩到终端像素尺寸并对齐条带，再合成背景色
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
-                                      colors=args.colors)
+                                      colors=args.colors,
+                                      extra_bottom_px=_safe_pad_px())
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
             composite_bg(png, bg, final, args.margin)
             # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）
