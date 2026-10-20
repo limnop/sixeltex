@@ -510,10 +510,9 @@ def build_width_setup(columns: int, enabled: bool = True) -> tuple[str, str]:
 
 def wrap_body_for_width(body: str, width_setup: str) -> str:
     r"""
-    用 \parbox 包住正文以限制宽度，让超宽内容按终端列数折行。
-
-    不对以 \[ 或 \begin{equation} 开头的内容包裹：行间公式与数学环境的
-    宽度由内容决定，包进 parbox 会破坏其排版。
+    用 \parbox 包住正文以限制宽度。
+    只对"含文本"的内容包裹：纯行间公式（\[...\]）本身宽度由公式决定，
+    包 parbox 反而可能破坏行间公式排版，故不包。
     """
     if not width_setup:
         return body
@@ -628,70 +627,96 @@ def is_full_document(text: str) -> bool:
 
 def _looks_like_prose(text: str) -> bool:
     """
-    判断输入是否"像正文文本"而不是"纯数学"。
-
-    判定标准（任一命中即视为正文）：
-      * 含中日韩字符
-      * 含空白分隔的西文单词（两个以上连续字母加空格），如 "hello world"
-      * 含既非数学也非命令的裸西文单词，如 "abc"
-
-    用途：-S/--math-scale 只应对纯数学输入生效。若把正文文本套进
-    \\scalebox{...}{$...$}，等于把文本强行变成数学模式，字母会被
-    按数学斜体渲染、空格被忽略，结果与输入意图不符。
+    判断输入是否"像散文/混排文本"而不是"纯数学"。
+    含中日韩字符，或含大量非数学类西文单词时，认为是正文，
+    不再强行套 \\[ ... \\] / align* —— 否则内嵌的 $...$ 会和外层
+    定界符冲突（"Display math should end with $$"）。
     """
-    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", text):
-        return True
-    # 两个以上连续字母、且前后是空白或字符串边界：视为西文单词
-    if re.search(r"(?:^|\s)[A-Za-z]{2,}(?:\s|$)", text):
+    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
         return True
     return False
 
 
 def _scale_inline(text: str, scale: float | None) -> str:
-    r"""对纯数学输入套 \scalebox{factor}{$...$} 实现连续字号缩放。
+    r"""对纯数学文本套 \scalebox{factor}{$...$} 实现连续字号缩放。
 
     注意套裹层级：\scalebox 的参数必须是 $...$ 行内公式，
     不能是 \[ ... \] 行间公式（后者在 hbox 内会报
-    "Missing $ inserted"，已实测）。
+    "Missing $ inserted"，已实测）。因此缩放在包定界符之前做。
 
-    以下三种情况原样返回、不缩放：
-      * scale 为 None / 1.0
-      * 输入像正文文本（含中文或西文单词）——汉字会被撕伸变形，
-        西文单词会被按数学斜体渲染
-      * 输入已自带数学定界符（$...$ / $$...$$ / \[...\]）——
-        再包一层会造成定界符嵌套，报 "Display math should end with $$"
+    scale 为 None/1.0 时原样返回。
+    含中日韩文字时不缩放（汉字会被撕伸变形）。
     """
     if not scale or scale == 1.0:
         return text
     if _looks_like_prose(text):
         return text
-    stripped = text.strip()
-    if stripped.startswith(("$", "\\(", "\\[")):
-        return text
     return r"\scalebox{%s}{$\displaystyle %s$}" % (scale, text)
 
 
+def _has_math_env(text: str) -> bool:
+    """
+    检测输入是否自带了"数学类"环境。
+    这些环境必须处于数学模式内，直接放进正文会报
+    "Missing $ inserted"（如 \begin{pmatrix}）。
+    """
+    math_envs = (
+        "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix",
+        "smallmatrix", "array", "cases", "dcases", "rcases", "aligned",
+        "gathered", "split", "multline", "equation", "align", "gather",
+        "flalign", "eqnarray", "subequations",
+    )
+    for env in math_envs:
+        if re.search(r"\\begin\{" + env + r"\*?\}", text):
+            return True
+    return False
+
+
 def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
-    r"""
-    表达式模式：输入按原样作为正文，不自动套任何数学定界符。
+    """
+    表达式模式：把输入包进合适的环境。
+    用户可用 -e/--env 强制指定环境。默认按内容自动选择：
+      含 \\begin{...} 已自带环境 -> 原样放入
+      含中日韩文字/正文文本       -> 原样作为正文段落（保留其中的 $...$）
+      含换行或多个公式            -> align*
+      其余（纯数学）              -> \\[ ... \\] 行间公式
 
-    数学模式的唯一来源是使用者自己写的 $...$（或 \\(...\\)、$$...$$）。
-    即"输入即文本模式"，不在外层补 \\[ ... \\] 或 align*。
-
-    为什么不再自动判定：自动包定界符必须猜"这是数学还是正文"，
-    而猜错就有两类后果——把正文套进 \\[...\\] 会改变排版语义，
-    把 $...$ 套进 \\[...\\] 则直接报 "Display math should end with $$"。
-    去掉猜测后行为可预测：你想行间公式就自己写 $$...$$ 或 \[...\]，
-    想行内公式就写 $...$，工具不再介入。
-
-    -e/--env 仍可强制指定数学环境，此时由使用者显式承担定界符责任。
-    -S/--math-scale 仍生效，但只包在整段输入外层，不再拆散内部结构。
+    纯数学输入会先剥掉外层一对 $ 或 \\( \\)，避免 \\[$...$\\] 这类
+    定界符嵌套冲突（"Display math should end with $$"）。
     """
     text = text.strip()
+    # 剥掉外层 $...$（整段被一对 $ 包裹时才剥，避免误伤 $a$$b$ 之类）
+    if len(text) >= 2 and text.startswith("$") and text.endswith("$") \
+            and not text.startswith("$$") and not text.endswith("$$"):
+        inner = text[1:-1]
+        if "$" not in inner:
+            text = inner.strip()
+    # 剥掉外层 \( ... \)
+    if text.startswith("\\(") and text.endswith("\\)"):
+        inner = text[2:-2]
+        if "\\(" not in inner and "\\)" not in inner:
+            text = inner.strip()
+
     env = fields.get("math_env")
     if env:
         return "\\begin{%s}\n%s\n\\end{%s}" % (env, text, env)
-    return _scale_inline(text, scale)
+    # 正文/混排优先判定：含中文的内容本就是段落文本，
+    # 即使内部有 pmatrix 之类的数学环境，也应当由它自己的 $...$
+    # 定界符包住，不能在外层再套 \\[...\\]（否则与内层 $
+    # 冲突，报 "Display math should end with $$"）。
+    if _looks_like_prose(text):
+        return text
+    if _has_math_env(text):
+        # 纯数学环境（无中文）本身就在数学模式内，只需外面套行间定界符
+        return "\\[\n%s\n\\]" % text
+    if re.search(r"\\begin\{", text):
+        # 其它环境（如 itemize/tabular）本就属文本模式，尊重原样
+        return text
+    if "\n" in text or re.search(r"\\\\", text):
+        inner = _scale_inline(text, scale)
+        return "\\begin{align*}\n%s\n\\end{align*}" % inner
+    inner = _scale_inline(text, scale)
+    return "\\[\n%s\n\\]" % inner
 
 
 # ---------------------------------------------------------------------------
@@ -715,15 +740,7 @@ def compile_tex(tex: str, workdir: str) -> str:
     if proc.returncode != 0 or not os.path.exists(pdf):
         sys.stderr.write("sixeltex: xelatex 编译失败。日志尾部：\n")
         with open(logfile, encoding="utf-8", errors="replace") as lf:
-            logtail = lf.read()[-4000:]
-        sys.stderr.write(logtail)
-        # 最常见的坑：输入按文本模式编译，但里面含 ^ _ & 等数学专用字符。
-        # 新语义下输入即文本，数学内容必须自己用 $...$ 或 \[...\] 包住。
-        if "Missing $ inserted" in logtail:
-            sys.stderr.write(
-                "\n提示：输入按【文本模式】编译，数学内容需自行用 $...$ 包住。\n"
-                "      例：sixeltex '$x^2$' 而不是 sixeltex 'x^2'\n"
-                "      行间公式用 $$...$$ 或 \\[...\\]。\n")
+            sys.stderr.write(lf.read()[-4000:])
         sys.stderr.write("\n提示：用 -k 保留工作目录可查看完整 .tex 与 .log\n")
         sys.exit(1)
     # 顺带报告缺字（不影响退出码，但用户需要知道中文是否渲染出来了）
@@ -1358,19 +1375,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="渲染 LaTeX / 中文 / 数学表达式为 sixel 终端图形（走真实 xelatex）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
-输入模式说明:
-  表达式输入按【文本模式】原样编译，数学内容需自己用定界符包住：
-    $...$     行内公式        sixeltex '$x^2$'
-    $$...$$   行间公式        sixeltex '$$\\frac{1}{1+x}$$'
-    \\[...\\]   行间公式（LaTeX 原生写法）
-  含 \\documentclass 的输入判定为完整 .tex 文件，原样交给 xelatex。
-
 示例:
-  sixeltex '$\\frac{1}{1+x}$'               单个行内公式
-  sixeltex '$$\\frac{1}{1+x}$$'             行间公式
-  sixeltex '设 $f(x)=x^2$，则 $f''(x)=2x$'  中英混排
-  echo 'x^2' | sixeltex                    标准输入
-  sixeltex doc.tex                         完整 .tex 文件(含 \\documentclass)
+  sixeltex '\\frac{1}{1+x}'                单个公式
+  sixeltex '$E=mc^2$'                      带 $ 也行，自动剥掉
+  echo 'x^2' | sixeltex                   标准输入
+  sixeltex '中文测试: $f(x)=x^2$'           中英混排
+  sixeltex doc.tex                        完整 .tex 文件(含 \\documentclass)
   sixeltex -t beamer -C "Noto Sans CJK SC" '内容'
 
 环境变量:
@@ -1401,7 +1411,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-S", "--math-scale", dest="math_scale", type=float,
                    default=None,
                    help="数学公式连续缩放倍数，如 1.5 或 0.8。默认不缩放。"
-                        "仅对纯数学生效；含中文或西文单词的正文不缩放")
+                        "仅对纯数学生效，含中文的正文不缩放（避免字形被拉伸）")
     p.add_argument("-p", "--colors", type=int, default=256,
                    help="sixel 调色板颜色数，默认 256")
     p.add_argument("-t", "--doc-class", dest="doc_class", default=None,
