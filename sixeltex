@@ -340,6 +340,110 @@ def check_dependencies() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2.1 宏包自动补充 —— 表达式用了模板未加载的宏包时，自动追加 \usepackage
+# ---------------------------------------------------------------------------
+# 背景：模板只固定加载 amsmath/amssymb/xcolor/unicode-math/graphicx/geometry，
+# 输入若用了 tikzpicture、\SI 等会直接编译失败（Undefined control sequence /
+# Environment xxx undefined）。
+# 做法：扫描输入里的 \命令 与 \begin{环境}，查下面的映射表；命中的宏包若尚未
+# 加载、且 kpsewhich 确认本机存在，则追加进 \usepackage 列表。
+# 查表不到、宏包未装都不阻塞：按原样编译，让 LaTeX 自己的报错原样呈现。
+# 只查一次表，不重试。完整文件模式不做自动补充（preamble 由使用者全权负责）。
+AUTO_PKG_FIXED = ("amsmath", "amssymb", "xcolor", "unicode-math",
+                  "graphicx", "geometry")
+
+# 命令 -> 宏包。键不带反斜杠。
+# 注意 \qty 在 siunitx 与 physics 里都有定义，这里归 siunitx；
+# 需要 physics 版 \qty 的用 -P 手动指定。
+AUTO_PKG_COMMANDS = {
+    "tikz": "tikz", "tikzset": "tikz", "usetikzlibrary": "tikz",
+    "draw": "tikz", "node": "tikz", "path": "tikz",
+    "addplot": "pgfplots", "pgfplotsset": "pgfplots",
+    "SI": "siunitx", "si": "siunitx", "qty": "siunitx",
+    "unit": "siunitx", "num": "siunitx", "ang": "siunitx",
+    "ce": "mhchem", "pu": "mhchem",
+    "chemfig": "chemfig",
+    "cancel": "cancel", "bcancel": "cancel",
+    "bm": "bm",
+    "dv": "physics", "pdv": "physics",
+    "coloneqq": "mathtools",
+    "toprule": "booktabs", "midrule": "booktabs",
+    "bottomrule": "booktabs", "cmidrule": "booktabs",
+    "multirow": "multirow",
+    "sout": "ulem", "uline": "ulem", "uwave": "ulem",
+    "hl": "soul", "st": "soul",
+    "href": "hyperref", "url": "hyperref",
+}
+
+# 环境 -> 宏包。键是 \begin{...} 大括号里的内容。
+# amsmath 系（matrix/align/cases 等）模板已加载，不列。
+AUTO_PKG_ENVS = {
+    "tikzpicture": "tikz", "scope": "tikz",
+    "axis": "pgfplots",
+    "circuitikz": "circuitikz",
+    "longtable": "longtable", "tabularx": "tabularx",
+    "niceTabular": "nicematrix", "NiceMatrix": "nicematrix",
+    "pNiceMatrix": "nicematrix",
+    "tcolorbox": "tcolorbox",
+}
+
+
+def _kpsewhich_has(pkg: str) -> bool:
+    """kpsewhich 确认宏包在本机存在；kpsewhich 不可用视为无法确认。"""
+    try:
+        proc = subprocess.run(["kpsewhich", pkg + ".sty"],
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def _usepackages_in(preamble: str) -> list[str]:
+    r"""从 -A/--preamble 原文里解析出已声明的宏包名（含带选项的形式）。"""
+    out: list[str] = []
+    for group in re.findall(r"\\usepackage(?:\[[^\]]*\])?\{([^}]*)\}",
+                            preamble or ""):
+        for name in group.split(","):
+            name = name.strip()
+            if name:
+                out.append(name)
+    return out
+
+
+def detect_missing_packages(text: str,
+                            already_loaded: list[str]) -> list[tuple[str, str]]:
+    r"""
+    扫描输入文本，返回应自动补充的 (宏包, 命中来源) 列表。
+
+    already_loaded：模板固定宏包 + 使用者经 -P/-A 已给的宏包，用于去重。
+    """
+    loaded = set(AUTO_PKG_FIXED) | set(already_loaded)
+    pairs: list[tuple[str, str]] = []      # (宏包, 命中来源)
+    for tok in sorted(set(re.findall(r"\\([a-zA-Z]+)", text))):
+        pkg = AUTO_PKG_COMMANDS.get(tok)
+        if pkg:
+            pairs.append((pkg, "\\" + tok))
+    for env in sorted(set(re.findall(r"\\begin\{([a-zA-Z@*]+)\}", text))):
+        pkg = AUTO_PKG_ENVS.get(env)
+        if pkg:
+            pairs.append((pkg, "\\begin{%s}" % env))
+    hits: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for pkg, src in pairs:
+        if pkg in loaded or pkg in seen:
+            continue
+        if not _kpsewhich_has(pkg):
+            sys.stderr.write(
+                "sixeltex: 命中 %s（需要宏包 %s），但本机找不到 %s.sty，"
+                "不自动补充；请先安装提供该宏包的 TeX Live 组件\n"
+                % (src, pkg, pkg))
+            continue
+        seen.add(pkg)
+        hits.append((pkg, src))
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # 3. 终端颜色探测（OSC 10/11），继承 sixelmath 的三级回退思路
 # ---------------------------------------------------------------------------
 def _osc_query(ps: int) -> str | None:
@@ -764,8 +868,8 @@ def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
       含换行或多个公式            -> align*
       其余（纯数学）              -> \\[ ... \\] 行间公式
 
-    纯数学输入会先剥掉外层一对 $ 或 \\( \\)，避免 \\[$...$\\] 这类
-    定界符嵌套冲突（"Display math should end with $$"）。
+    纯数学输入会先剥掉外层一对 $、$$、\\( \\) 或 \\[ \\]，避免
+    \\[$...$\\] 这类定界符嵌套冲突（"Display math should end with $$"）。
     """
     text = text.strip()
     # 剥掉外层 $...$（整段被一对 $ 包裹时才剥，避免误伤 $a$$b$ 之类）
@@ -778,6 +882,16 @@ def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
     if text.startswith("\\(") and text.endswith("\\)"):
         inner = text[2:-2]
         if "\\(" not in inner and "\\)" not in inner:
+            text = inner.strip()
+    # 剥掉外层 $$ ... $$（内部无其它 $$ 时才剥，多对并存的情形仍按原样）
+    if text.startswith("$$") and text.endswith("$$") and len(text) >= 4:
+        inner = text[2:-2]
+        if "$$" not in inner:
+            text = inner.strip()
+    # 剥掉外层 \[ ... \]（内部无其它 \[ 或 \] 时才剥）
+    if text.startswith("\\[") and text.endswith("\\]") and len(text) >= 4:
+        inner = text[2:-2]
+        if "\\[" not in inner and "\\]" not in inner:
             text = inner.strip()
 
     env = fields.get("math_env")
@@ -821,9 +935,15 @@ def compile_tex(tex: str, workdir: str) -> str:
         )
     pdf = os.path.join(workdir, "sixeltex.pdf")
     if proc.returncode != 0 or not os.path.exists(pdf):
-        sys.stderr.write("sixeltex: xelatex 编译失败。日志尾部：\n")
         with open(logfile, encoding="utf-8", errors="replace") as lf:
-            sys.stderr.write(lf.read()[-4000:])
+            log_text = lf.read()
+        sys.stderr.write("sixeltex: xelatex 编译失败。日志尾部：\n")
+        sys.stderr.write(log_text[-4000:])
+        m = re.search(r"! LaTeX Error: File `([^']+\.sty)' not found", log_text)
+        if m:
+            sys.stderr.write(
+                "sixeltex: 缺少宏包文件 %s——请安装提供它的 TeX Live 组件后重试\n"
+                % m.group(1))
         sys.stderr.write("\n提示：用 -k 保留工作目录可查看完整 .tex 与 .log\n")
         sys.exit(1)
     # 顺带报告缺字（不影响退出码，但用户需要知道中文是否渲染出来了）
@@ -1501,10 +1621,15 @@ def render(text: str, args: argparse.Namespace) -> None:
     fields = dict(DEFAULTS)
     if args.doc_class:
         fields["doc_class"] = args.doc_class
-    if args.packages:
-        # 使用者给的宏包名列表 -> \usepackage{...} 多行文本
-        fields["extra_packages"] = "\n".join(
-            "\\usepackage{%s}" % p for p in args.packages)
+    # 宏包清单：-P 给的（一次一个宏包，也接受逗号分隔），去空白后逐个进列表
+    pkg_list: list[str] = []
+    for spec in (args.packages or []):
+        for name in spec.split(","):
+            name = name.strip()
+            if name:
+                pkg_list.append(name)
+    fields["extra_packages"] = "\n".join(
+        "\\usepackage{%s}" % p for p in pkg_list)
     if args.preamble:
         fields["preamble_extra"] = args.preamble
     if args.math_env:
@@ -1585,6 +1710,16 @@ def render(text: str, args: argparse.Namespace) -> None:
         tex = text
         mode = "完整文件"
     else:
+        # 宏包自动补充：扫描输入，把模板没加载、-P/-A 也没给的宏包补上
+        if args.auto_packages:
+            known = pkg_list + _usepackages_in(args.preamble or "")
+            auto = detect_missing_packages(text, known)
+            if auto:
+                pkg_list.extend(p for p, _ in auto)
+                fields["extra_packages"] = "\n".join(
+                    "\\usepackage{%s}" % p for p in pkg_list)
+                sys.stderr.write("sixeltex: 自动补充宏包: %s\n" % ", ".join(
+                    "%s（命中 %s）" % (p, s) for p, s in auto))
         body = wrap_expression(text, fields, args.math_scale)
         # 按终端列宽折行，避免渲染出一行超长内容
         fields["body"] = wrap_body_for_width(body, width_setup)
@@ -1738,8 +1873,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sixel 调色板颜色数，默认 256")
     p.add_argument("-t", "--doc-class", dest="doc_class", default=None,
                    help="文档类：ctexart(默认)/ctexrep/ctexbook/article/beamer")
-    p.add_argument("-P", "--packages", nargs="+", default=None,
-                   help="追加宏包列表（空格分隔），如 -P tikz pgfplots")
+    p.add_argument("-P", "--packages", dest="packages", action="append",
+                   default=None, metavar="PKG",
+                   help="追加宏包，一次一个；多个用逗号分隔或重复 -P，"
+                        "如 -P tikz,pgfplots 或 -P tikz -P pgfplots。"
+                        "表达式要写在 -P 之前（或经标准输入），否则会被 -P 吞掉")
+    p.add_argument("--no-auto-package", dest="auto_packages",
+                   action="store_false",
+                   help="关闭宏包自动补充。默认开启：输入用了模板未加载的宏包"
+                        "（如 tikzpicture、\\SI）时自动追加 \\usepackage，"
+                        "以 kpsewhich 确认本机存在为前提")
     p.add_argument("-A", "--preamble", default=None,
                    help="额外插入 preamble 的原文（每行一条）")
     p.add_argument("-e", "--env", dest="math_env", default=None,
