@@ -403,11 +403,3 @@ bbox 裁剪。
 ## 许可证
 
 **本项目当前未声明开源许可证。**
-
-这意味着默认适用著作权法——他人**没有**明确的权利来使用、修改或分发本代码。
-如果你打算让他人使用，建议在仓库根目录添加一份许可证文件。常见选择：
-
-- [MIT](https://choosealicense.com/licenses/mit/)：最简约，广泛用于单文件工具
-- [Apache-2.0](https://choosealicense.com/licenses/apache-2.0/)：含明确专利授权
-
-选定后把许可证全文存为 `LICENSE`，并把本节替换为一句 `MIT License` 之类的声明即可。
