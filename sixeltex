@@ -1136,8 +1136,8 @@ def resize_for_terminal(png: str, target_w: int | None = None,
     2. 底部垫背空白 + 对齐 6 的倍数
        sixel 每 6 行一个带，高度非 6 倍数时最后一个带不满。
        补在底部（-gravity south）而非顶部，避免把内容往下推。
-       垫背由 _bottom_pad_px 按行占用规划：默认"填进行边界以内
-       的空白"，不再把图像顶过行边界（旧行为的副作用）。
+       垫背按整行规划（_bottom_pad_px）：终端按整行粒度从底部
+       裁掉超出窗口的部分，垫背不足一整行挡不住裁切。
 
     保留 alpha 通道——由调用方决定是否合成背景色。
     """
@@ -1183,30 +1183,22 @@ def _bottom_pad_px(h: int, rows: int, cell_h: float | None) -> int:
     底部垫背空白该留多少像素（含 sixel 6 像素带对齐），返回值直接 splice。
 
     规则（cell_h 为探测到的终端行高，未知时按 16px 兜底）：
-      rows <= 0  不垫背：仅补带对齐所需的 <=5px（与旧行为一致）。
-      rows >= 1  垫背优先填进"行边界以内"的空白——终端按整行推进，
-                 行内填充零成本（见终端推进规则的实测结论）；
-                 图像正好压线（带对齐后的高度是行高整倍数）时
-                 补一整行保证有垫背；再按 rows-1 加额外整行，
-                 供 --sacrifice-rows 2/3 显式多垫的场合。
+      rows <= 0  不垫背：仅补带对齐所需的 <=5px。
+      rows >= 1  垫 N 个整行，再做带对齐。
 
-    与旧规则（固定垫 rows 个整行）相比：默认 rows=1 时垫背不再把
-    图像顶过行边界，"小公式底部空白偏大"由此消除。
+    为什么必须是整行：终端对超出窗口的 sixel 按整行粒度从底部裁掉，
+    垫背不足一整行时，被裁部分会直接切进正文——实测（f478dda 曾把
+    垫背改成"填进行边界以内的空白"，结果真实终端里垫背经常凑不满
+    一整行，表现为最后一行只剩上半部分，当晚回退）。整行垫背是
+    实测有效的下限；代价是默认比不垫多占一行，属设计取舍，
+    由 --sacrifice-rows 0 显式放弃保护。
     """
     align = (-h) % 6
     if rows <= 0:
         return align
     cell = int(round(cell_h)) if cell_h and cell_h > 0 else 16
-    h_min = h + align                       # 带对齐后的实际图像高度
-    occupied = -(-h_min // cell)            # ceil：无论如何至少占的行数
-    if h_min % cell == 0:
-        occupied += 1                       # 压线：补一行，保证有垫背
-    occupied += rows - 1                    # 显式要求的额外整行
-    H = occupied * cell
-    H -= H % 6                              # 不超过目标行数的最大 6 倍数
-    total = H - h
-    if total < align:
-        total = align                       # 防御：至少保证带对齐
+    total = rows * cell
+    total += (-(h + total)) % 6
     return total
 
 
@@ -1890,10 +1882,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "边缘靠混到这个颜色来产生平滑过渡")
     p.add_argument("--sacrifice-rows", dest="sacrifice_rows", type=int,
                    default=SAFE_BOTTOM_PAD_ROWS, metavar="N",
-                   help="预备牺牲行数，默认 %d。图像底部预留垫背空白：终端空间"
-                        "不足时先裁掉这些空白，正文不受影响。垫背默认填进行边界"
-                        "以内的空白（零成本），压线时补一行；N>=2 再额外垫 N-1 "
-                        "个整行（半屏/矮窗口保险）。0 表示不预留"
+                   help="预备牺牲行数，默认 %d。在图像底部多渲染 N 个终端行高的"
+                        "透明像素当垫背：终端空间不足时按整行从底部裁，"
+                        "垫背先被裁掉，正文不受影响。0 表示不预留"
+                        "（空间不足时末尾内容会被裁掉）"
                         % SAFE_BOTTOM_PAD_ROWS)
     p.add_argument("-m", "--margin", type=int, default=0,
                    help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
