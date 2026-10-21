@@ -870,6 +870,8 @@ def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
 
     纯数学输入会先剥掉外层一对 $、$$、\\( \\) 或 \\[ \\]，避免
     \\[$...$\\] 这类定界符嵌套冲突（"Display math should end with $$"）。
+    多对 $$...$$ / \\[...\\] 并存时不剥也不套，按原样放入正文
+    （display 定界符在文本模式里合法）。
     """
     text = text.strip()
     # 剥掉外层 $...$（整段被一对 $ 包裹时才剥，避免误伤 $a$$b$ 之类）
@@ -908,6 +910,11 @@ def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
         return "\\[\n%s\n\\]" % text
     if re.search(r"\\begin\{", text):
         # 其它环境（如 itemize/tabular）本就属文本模式，尊重原样
+        return text
+    if re.search(r"\$\$|\\\[|\\\]", text):
+        # 自带 display 数学定界符（多对 $$...$$ 或 \[...\] 并存；
+        # 单对外层已在上面剥掉）：它们在文本模式里本就合法，
+        # 尊重原样放入正文，不再外套定界符——否则嵌套 display math 必报错
         return text
     if "\n" in text or re.search(r"\\\\", text):
         inner = _scale_inline(text, scale)
@@ -1114,7 +1121,8 @@ def pdf_to_transparent_png(pdf: str, workdir: str, dpi: int) -> str:
 def resize_for_terminal(png: str, target_w: int | None = None,
                         supersample: int = 1,
                         colors: int | None = None,
-                        extra_bottom_px: int = 0) -> str:
+                        sacrifice_rows: int = 0,
+                        cell_h: float | None = None) -> str:
     r"""
     把高 DPI 渲染出的 PNG 缩到终端像素尺寸，并对齐 sixel 条带高度。
 
@@ -1125,9 +1133,11 @@ def resize_for_terminal(png: str, target_w: int | None = None,
        等效于高质量抗锯齿，比直接按目标 DPI 渲染取样密度高。
        缩放的同时量化到指定颜色数，避免抗锯齿中间色把调色板撑爆。
 
-    2. 底部补透明像素到 6 的倍数
+    2. 底部垫背空白 + 对齐 6 的倍数
        sixel 每 6 行一个带，高度非 6 倍数时最后一个带不满。
        补在底部（-gravity south）而非顶部，避免把内容往下推。
+       垫背由 _bottom_pad_px 按行占用规划：默认"填进行边界以内
+       的空白"，不再把图像顶过行边界（旧行为的副作用）。
 
     保留 alpha 通道——由调用方决定是否合成背景色。
     """
@@ -1152,11 +1162,10 @@ def resize_for_terminal(png: str, target_w: int | None = None,
             timeout=300, check=True)
         png, w, h = scaled, new_w, new_h
 
-    # 底部垫背空白 + 对齐 6 的倍数，一次 splice 完成。
-    # 垫背的那几行是为了在终端空间不足时"代替正文被裁掉"，
-    # 见 SAFE_BOTTOM_PAD_ROWS 的说明。
-    total = max(0, int(extra_bottom_px))
-    total += (-(h + total)) % 6
+    # 底部垫背空白（行占用规划与 6 像素带对齐一体完成，一次 splice）。
+    # 垫背的作用：终端空间不足时代替正文被裁掉，
+    # 规则见 _bottom_pad_px 与 SAFE_BOTTOM_PAD_ROWS 的说明。
+    total = _bottom_pad_px(h, sacrifice_rows, cell_h)
     if total:
         padded = os.path.join(work, "sixeltex-padded.png")
         subprocess.run(
@@ -1169,16 +1178,36 @@ def resize_for_terminal(png: str, target_w: int | None = None,
     return png
 
 
-def _safe_pad_px(rows: int) -> int:
+def _bottom_pad_px(h: int, rows: int, cell_h: float | None) -> int:
     """
-    底部垫背空白该留多少像素：rows 个终端行高。
+    底部垫背空白该留多少像素（含 sixel 6 像素带对齐），返回值直接 splice。
 
-    终端行高优先用探测值；拿不到时按 16px 兜底（与 DPI 反算的兜底一致）。
+    规则（cell_h 为探测到的终端行高，未知时按 16px 兜底）：
+      rows <= 0  不垫背：仅补带对齐所需的 <=5px（与旧行为一致）。
+      rows >= 1  垫背优先填进"行边界以内"的空白——终端按整行推进，
+                 行内填充零成本（见终端推进规则的实测结论）；
+                 图像正好压线（带对齐后的高度是行高整倍数）时
+                 补一整行保证有垫背；再按 rows-1 加额外整行，
+                 供 --sacrifice-rows 2/3 显式多垫的场合。
+
+    与旧规则（固定垫 rows 个整行）相比：默认 rows=1 时垫背不再把
+    图像顶过行边界，"小公式底部空白偏大"由此消除。
     """
-    if not rows or rows <= 0:
-        return 0
-    cell_h = _CELL_H_PX if _CELL_H_PX else 16.0
-    return int(round(rows * cell_h))
+    align = (-h) % 6
+    if rows <= 0:
+        return align
+    cell = int(round(cell_h)) if cell_h and cell_h > 0 else 16
+    h_min = h + align                       # 带对齐后的实际图像高度
+    occupied = -(-h_min // cell)            # ceil：无论如何至少占的行数
+    if h_min % cell == 0:
+        occupied += 1                       # 压线：补一行，保证有垫背
+    occupied += rows - 1                    # 显式要求的额外整行
+    H = occupied * cell
+    H -= H % 6                              # 不超过目标行数的最大 6 倍数
+    total = H - h
+    if total < align:
+        total = align                       # 防御：至少保证带对齐
+    return total
 
 
 def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
@@ -1771,7 +1800,8 @@ def render(text: str, args: argparse.Namespace) -> None:
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
                                       colors=args.colors,
-                                      extra_bottom_px=_safe_pad_px(args.sacrifice_rows))
+                                      sacrifice_rows=args.sacrifice_rows,
+                                      cell_h=_CELL_H_PX)
             if args.margin and args.margin > 0:
                 bordered = os.path.join(workdir_ctx, "sixeltex-margin.png")
                 subprocess.run(
@@ -1795,7 +1825,8 @@ def render(text: str, args: argparse.Namespace) -> None:
             png = resize_for_terminal(png, target_w=target_w,
                                       supersample=supersample,
                                       colors=args.colors,
-                                      extra_bottom_px=_safe_pad_px(args.sacrifice_rows))
+                                      sacrifice_rows=args.sacrifice_rows,
+                                      cell_h=_CELL_H_PX)
             final = os.path.join(workdir_ctx, "sixeltex-composited.png")
             composite_bg(png, bg, final, args.margin)
             # -k 保存"最终要显示的那张图"（已缩放、已补边、已合成背景）
@@ -1859,9 +1890,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "边缘靠混到这个颜色来产生平滑过渡")
     p.add_argument("--sacrifice-rows", dest="sacrifice_rows", type=int,
                    default=SAFE_BOTTOM_PAD_ROWS, metavar="N",
-                   help="预备牺牲行数，默认 %d。在图像底部多渲染 N 个终端行高的"
-                        "透明像素当垫背：终端空间不足时先裁掉这些空白，正文不受影响。"
-                        "0 表示不预留（空间不足时末尾内容会被裁掉）"
+                   help="预备牺牲行数，默认 %d。图像底部预留垫背空白：终端空间"
+                        "不足时先裁掉这些空白，正文不受影响。垫背默认填进行边界"
+                        "以内的空白（零成本），压线时补一行；N>=2 再额外垫 N-1 "
+                        "个整行（半屏/矮窗口保险）。0 表示不预留"
                         % SAFE_BOTTOM_PAD_ROWS)
     p.add_argument("-m", "--margin", type=int, default=0,
                    help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
