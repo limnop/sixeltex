@@ -1184,22 +1184,27 @@ def _bottom_pad_px(h: int, rows: int, cell_h: float | None) -> int:
 
     规则（cell_h 为探测到的终端行高，未知时按 16px 兜底）：
       rows <= 0  不垫背：仅补带对齐所需的 <=5px。
-      rows >= 1  垫 N 个整行，再做带对齐。
+      rows >= 1  先垫 N 个整行（实测下限：终端按整行粒度从底部裁，
+                 垫背不足一整行挡不住裁切，见 f478dda 的教训），
+                 带对齐后若当前占用行内还有余量，再用整带（6px）
+                 填满——不增加占用行数的零成本垫背，吸收末带被
+                 整带丢弃时的几像素过切（实测末行差 1~2px 的场景）。
 
-    为什么必须是整行：终端对超出窗口的 sixel 按整行粒度从底部裁掉，
-    垫背不足一整行时，被裁部分会直接切进正文——实测（f478dda 曾把
-    垫背改成"填进行边界以内的空白"，结果真实终端里垫背经常凑不满
-    一整行，表现为最后一行只剩上半部分，当晚回退）。整行垫背是
-    实测有效的下限；代价是默认比不垫多占一行，属设计取舍，
-    由 --sacrifice-rows 0 显式放弃保护。
+    注意 H 永远是 6 的倍数（sixel 带对齐），且不超过"最小可行占用
+    行数 × 行高"，占用行数与只垫整行的方案相同。
     """
     align = (-h) % 6
     if rows <= 0:
         return align
     cell = int(round(cell_h)) if cell_h and cell_h > 0 else 16
-    total = rows * cell
-    total += (-(h + total)) % 6
-    return total
+    floor_total = rows * cell
+    H_min = h + floor_total + (-(h + floor_total)) % 6   # 最小可行高度（6 对齐）
+    occupied = -(-H_min // cell)                          # 最小可行占用的行数
+    H = occupied * cell
+    H -= H % 6                                            # 行内余量用整带填满
+    if H < H_min:
+        H = H_min                                         # 塞不下一带：保底
+    return H - h
 
 
 def composite_bg(png: str, bg: str, out: str, margin: int = 0) -> str:
@@ -1884,8 +1889,9 @@ def build_parser() -> argparse.ArgumentParser:
                    default=SAFE_BOTTOM_PAD_ROWS, metavar="N",
                    help="预备牺牲行数，默认 %d。在图像底部多渲染 N 个终端行高的"
                         "透明像素当垫背：终端空间不足时按整行从底部裁，"
-                        "垫背先被裁掉，正文不受影响。0 表示不预留"
-                        "（空间不足时末尾内容会被裁掉）"
+                        "垫背先被裁掉，正文不受影响。占用行内的剩余空白还会"
+                        "自动用整带填满（零成本多垫）。0 表示只做带对齐、"
+                        "完全不额外预留（空间不足时末尾内容会被裁掉）"
                         % SAFE_BOTTOM_PAD_ROWS)
     p.add_argument("-m", "--margin", type=int, default=0,
                    help="四周额外留白(像素)，默认 0。内容边界由 ghostscript 自动算")
