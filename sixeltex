@@ -411,11 +411,15 @@ def _usepackages_in(preamble: str) -> list[str]:
 
 
 def detect_missing_packages(text: str,
-                            already_loaded: list[str]) -> list[tuple[str, str]]:
+                            already_loaded: list[str],
+                            verbose: bool = False) -> list[tuple[str, str]]:
     r"""
     扫描输入文本，返回应自动补充的 (宏包, 命中来源) 列表。
 
     already_loaded：模板固定宏包 + 使用者经 -P/-A 已给的宏包，用于去重。
+    宏包本机不存在时不自动补充；提示只在 verbose 下显示（非内容输出
+    一律不进正常输出流，缺宏包导致的编译失败会由 compile_tex 的错误
+    报告照常说明）。
     """
     loaded = set(AUTO_PKG_FIXED) | set(already_loaded)
     pairs: list[tuple[str, str]] = []      # (宏包, 命中来源)
@@ -433,10 +437,11 @@ def detect_missing_packages(text: str,
         if pkg in loaded or pkg in seen:
             continue
         if not _kpsewhich_has(pkg):
-            sys.stderr.write(
-                "sixeltex: 命中 %s（需要宏包 %s），但本机找不到 %s.sty，"
-                "不自动补充；请先安装提供该宏包的 TeX Live 组件\n"
-                % (src, pkg, pkg))
+            if verbose:
+                sys.stderr.write(
+                    "sixeltex: 命中 %s（需要宏包 %s），但本机找不到 %s.sty，"
+                    "不自动补充；请先安装提供该宏包的 TeX Live 组件\n"
+                    % (src, pkg, pkg))
             continue
         seen.add(pkg)
         hits.append((pkg, src))
@@ -1736,16 +1741,18 @@ def render(text: str, args: argparse.Namespace) -> None:
         tex = text
         mode = "完整文件"
     else:
-        # 宏包自动补充：扫描输入，把模板没加载、-P/-A 也没给的宏包补上
+        # 宏包自动补充：扫描输入，把模板没加载、-P/-A 也没给的宏包补上。
+        # 补充是静默的（非内容输出只在 -v 下显示）
         if args.auto_packages:
             known = pkg_list + _usepackages_in(args.preamble or "")
-            auto = detect_missing_packages(text, known)
+            auto = detect_missing_packages(text, known, args.verbose)
             if auto:
                 pkg_list.extend(p for p, _ in auto)
                 fields["extra_packages"] = "\n".join(
                     "\\usepackage{%s}" % p for p in pkg_list)
-                sys.stderr.write("sixeltex: 自动补充宏包: %s\n" % ", ".join(
-                    "%s（命中 %s）" % (p, s) for p, s in auto))
+                if args.verbose:
+                    sys.stderr.write("sixeltex: 自动补充宏包: %s\n" % ", ".join(
+                        "%s（命中 %s）" % (p, s) for p, s in auto))
         body = wrap_expression(text, fields, args.math_scale)
         # 按终端列宽折行，避免渲染出一行超长内容
         fields["body"] = wrap_body_for_width(body, width_setup)
