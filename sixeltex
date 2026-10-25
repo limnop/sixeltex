@@ -26,7 +26,7 @@ import sys
 import tempfile
 import unicodedata
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 # ---------------------------------------------------------------------------
 # 1. 模板表 —— 唯一的"完整环境"定义处，所有参数都只改这里的字段
@@ -864,12 +864,277 @@ def _has_math_env(text: str) -> bool:
     return False
 
 
-def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
+# 混排正文里允许自动识别的数学命令白名单（显式列出，不做全量猜测）。
+# 只有这些命令出现在 $...$ 等保护区之外时才触发自动包裹；
+# \textbf、\ldots 等文本模式合法的命令不在表内，保持原样。
+MATH_COMMANDS = (
+    # 希腊字母
+    "alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta",
+    "eta", "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu",
+    "xi", "omicron", "pi", "varpi", "rho", "varrho", "sigma", "varsigma",
+    "tau", "upsilon", "phi", "varphi", "chi", "psi", "omega",
+    "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon",
+    "Phi", "Psi", "Omega",
+    # 二元运算与关系符
+    "times", "cdot", "div", "pm", "mp", "le", "leq", "ge", "geq", "ne",
+    "neq", "approx", "equiv", "sim", "simeq", "cong", "propto", "ll",
+    "gg", "subset", "subseteq", "supset", "supseteq", "in", "ni",
+    "notin", "cup", "cap", "setminus", "emptyset", "varnothing",
+    "forall", "exists", "nexists", "neg", "land", "lor", "oplus",
+    "otimes", "odot", "circ", "bullet", "star", "ast", "dagger",
+    "ddagger",
+    # 大型运算符
+    "sum", "prod", "coprod", "int", "iint", "iiint", "oint",
+    # 函数名（数学模式里排正体）
+    "log", "ln", "lg", "exp", "sin", "cos", "tan", "cot", "sec", "csc",
+    "arcsin", "arccos", "arctan", "sinh", "cosh", "tanh", "coth", "deg",
+    "det", "dim", "gcd", "max", "min", "sup", "inf", "lim", "limsup",
+    "liminf", "arg", "bmod",
+    # 常用符号与箭头（\ldots、\quad 等文本模式合法的不收）
+    "infty", "partial", "nabla", "hbar", "ell", "prime", "surd", "top",
+    "bot", "angle", "triangle", "square", "therefore", "because",
+    "cdots", "vdots", "ddots",
+    "to", "rightarrow", "leftarrow", "leftrightarrow", "Rightarrow",
+    "Leftarrow", "Leftrightarrow", "mapsto", "uparrow", "downarrow",
+    "nearrow", "searrow", "swarrow", "nwarrow",
+    # 分式/根式/定界符/重音等数学模式专用结构
+    "frac", "dfrac", "tfrac", "binom", "sqrt", "left", "right",
+    "big", "Big", "bigg", "Bigg",
+    "overline", "underline", "widehat", "widetilde",
+    "overbrace", "underbrace", "hat", "bar", "vec", "tilde", "dot",
+    "ddot", "check", "breve",
+)
+
+
+def _is_ascii_alpha(c: str) -> bool:
+    r"""ASCII 字母判定。不用 str.isalpha()：它对汉字也返回 True，
+    会把 `\pi的` 这种紧贴汉字的命令误读成一个超长控制词。"""
+    return "a" <= c <= "z" or "A" <= c <= "Z"
+
+
+def _is_ascii_alnum(c: str) -> bool:
+    return _is_ascii_alpha(c) or "0" <= c <= "9"
+
+
+# 向两侧扩展数学片段时可越过的字符（运算符、括号、上下标之外的结构符）
+_MATH_RUN_OPS = "=+-*/<>|()[]{}"
+
+
+def _scan_bare_math_tokens(text: str) -> list[tuple[int, int]] | None:
+    r"""
+    扫描混排文本，找出保护区之外、白名单内的"裸数学 token"。
+
+    保护区：$...$、$$...$$、\(...\)、\[...\]、\begin{...}...\end{...}，
+    以及 \\、\$ 等控制符号/转义序列——这些区域一律不动。
+    返回 [(start, end), ...]（token 在原文中的位置，按出现顺序）；
+    定界符配不上对等结构无法可靠解析时返回 None（调用方放弃改写）。
+    """
+    tokens: list[tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt == "(":
+                j = text.find("\\)", i + 2)
+                if j < 0:
+                    return None
+                i = j + 2
+                continue
+            if nxt == "[":
+                j = text.find("\\]", i + 2)
+                if j < 0:
+                    return None
+                i = j + 2
+                continue
+            if _is_ascii_alpha(nxt):
+                j = i + 1
+                while j < n and _is_ascii_alpha(text[j]):
+                    j += 1
+                word = text[i + 1:j]
+                if word == "begin" and j < n and text[j] == "{":
+                    # 任何环境（数学/文本）整体保护：里面的内容不自动改写
+                    k = text.find("}", j + 1)
+                    if k < 0:
+                        return None
+                    end_marker = "\\end{" + text[j + 1:k] + "}"
+                    k2 = text.find(end_marker, k + 1)
+                    if k2 < 0:
+                        return None
+                    i = k2 + len(end_marker)
+                    continue
+                if word in MATH_COMMANDS:
+                    tokens.append((i, j))
+                i = j
+                continue
+            # \\、\$、\% 等控制符号：连同转义字符整体跳过
+            i += 2
+            continue
+        if ch == "$":
+            if text[i:i + 2] == "$$":
+                j = text.find("$$", i + 2)
+                if j < 0:
+                    return None
+                i = j + 2
+            else:
+                j = i + 1
+                while j < n and text[j] != "$":
+                    if text[j] == "\\":
+                        j += 1
+                    j += 1
+                if j >= n:
+                    return None
+                i = j + 1
+            continue
+        if ch in "^_":
+            tokens.append((i, i + 1))
+        i += 1
+    return tokens
+
+
+def _extend_run_left(text: str, s: int) -> int:
+    """从 token 起点向左扩展数学片段，返回片段起点。
+
+    越过运算符/括号与空白；空白后的孤立单个字母数字视为数学变量
+    （如 `是 S=\\pi` 的 S），连续字母属英文单词（如 `of \\pi` 的 of），
+    一旦碰到就停。汉字与其它非 ASCII 字符天然是边界。"""
+    i = s
+    while i > 0:
+        c = text[i - 1]
+        if c in _MATH_RUN_OPS:
+            i -= 1
+            continue
+        if _is_ascii_alnum(c):
+            # 仅并入"孤立"字符：其左侧不再是字母数字
+            if i - 2 < 0 or not _is_ascii_alnum(text[i - 2]):
+                i -= 1
+                continue
+            break
+        if c in " \t":
+            j = i
+            while j > 0 and text[j - 1] in " \t":
+                j -= 1
+            if j == 0:
+                break
+            prev = text[j - 1]
+            prev2 = text[j - 2] if j >= 2 else ""
+            if _is_ascii_alnum(prev) and not _is_ascii_alnum(prev2):
+                i = j - 1
+                continue
+            if prev in _MATH_RUN_OPS:
+                i = j - 1
+                continue
+            break
+        break
+    return i
+
+
+def _extend_run_right(text: str, e: int) -> int:
+    """从 token 终点向右扩展数学片段，返回片段终点。
+
+    越过字母数字、运算符/括号、上下标、白名单命令；
+    3.14 这类小数点、f(x,y) 的并列逗号只在"两侧都是字母数字"时并入；
+    空白只在后面跟着孤立单字符/运算符/白名单命令时越过——
+    两个以上字母的英文单词（is、the）立即停，避免把英文句子吞进公式。"""
+    n = len(text)
+    i = e
+    while i < n:
+        c = text[i]
+        if c in _MATH_RUN_OPS or c in "^_":
+            i += 1
+            continue
+        if _is_ascii_alnum(c):
+            i += 1
+            continue
+        if c in ".,":
+            if i + 1 < n and _is_ascii_alnum(text[i + 1]):
+                i += 1
+                continue
+            break
+        if c == "\\":
+            j = i + 1
+            while j < n and _is_ascii_alpha(text[j]):
+                j += 1
+            if j > i + 1 and text[i + 1:j] in MATH_COMMANDS:
+                i = j
+                continue
+            break
+        if c in " \t":
+            j = i
+            while j < n and text[j] in " \t":
+                j += 1
+            if j >= n:
+                break
+            nxt = text[j]
+            if _is_ascii_alnum(nxt) \
+                    and (j + 1 >= n or not _is_ascii_alnum(text[j + 1])):
+                i = j + 1
+                continue
+            if nxt in _MATH_RUN_OPS or nxt in "^_" or nxt == "\\":
+                i = j
+                continue
+            break
+        break
+    return i
+
+
+def _auto_math_in_prose(text: str, enabled: bool = True) -> str:
+    r"""
+    混排正文：把保护区之外、白名单内的裸数学片段自动包进 $...$。
+
+    背景：正文段落处于文本模式，\pi、^、_ 这些数学模式专用命令
+    直接编译必报 "Missing $ inserted"（2026-10-25 用户实测
+    '圆的面积公式是 S=\pi r^2。'）。这里按白名单保守自动补 $...$，
+    让"中文 + 直接写公式"的输入开箱即用；--no-auto-math 可关闭。
+
+    保守策略：定界符配不上对时整篇放弃、原样返回；
+    改写发生时调用方会向 stderr 打一行提示，不做静默变换。
+    片段若以 ^/_ 开头（无底数的上下标，如文件名里的下划线）
+    补一个空组 {} 当底数，保证可编译。
+    """
+    if not enabled:
+        return text
+    tokens = _scan_bare_math_tokens(text)
+    if not tokens:
+        return text
+    spans = []
+    for ts, te in tokens:
+        spans.append((_extend_run_left(text, ts), _extend_run_right(text, te)))
+    spans.sort()
+    merged: list[list[int]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    out = []
+    last = 0
+    for s, e in merged:
+        seg = text[s:e]
+        core = seg.strip()
+        if not core:
+            continue
+        if core[0] in "^_":
+            core = "{}" + core
+        lead = seg[:len(seg) - len(seg.lstrip())]
+        trail = seg[len(seg.rstrip()):]
+        out.append(text[last:s])
+        out.append(lead + "$" + core + "$" + trail)
+        last = e
+    out.append(text[last:])
+    return "".join(out)
+
+
+def wrap_expression(
+        text: str, fields: dict, scale: float | None = None,
+        auto_math: bool = True) -> str:
     """
     表达式模式：把输入包进合适的环境。
     用户可用 -e/--env 强制指定环境。默认按内容自动选择：
       含 \\begin{...} 已自带环境 -> 原样放入
-      含中日韩文字/正文文本       -> 原样作为正文段落（保留其中的 $...$）
+      含中日韩文字/正文文本       -> 作为正文段落；裸数学片段自动包进 $...$
+                                    （auto_math=False 可关，保留已有 $...$）
       含换行或多个公式            -> align*
       其余（纯数学）              -> \\[ ... \\] 行间公式
 
@@ -909,7 +1174,12 @@ def wrap_expression(text: str, fields: dict, scale: float | None = None) -> str:
     # 定界符包住，不能在外层再套 \\[...\\]（否则与内层 $
     # 冲突，报 "Display math should end with $$"）。
     if _looks_like_prose(text):
-        return text
+        wrapped = _auto_math_in_prose(text, auto_math)
+        if auto_math and wrapped != text:
+            sys.stderr.write(
+                "sixeltex: 正文里的裸数学片段已自动包进 $...$"
+                "（--no-auto-math 可关闭）\n")
+        return wrapped
     if _has_math_env(text):
         # 纯数学环境（无中文）本身就在数学模式内，只需外面套行间定界符
         return "\\[\n%s\n\\]" % text
@@ -956,6 +1226,11 @@ def compile_tex(tex: str, workdir: str) -> str:
             sys.stderr.write(
                 "sixeltex: 缺少宏包文件 %s——请安装提供它的 TeX Live 组件后重试\n"
                 % m.group(1))
+        if "! Missing $ inserted." in log_text:
+            sys.stderr.write(
+                "sixeltex: 提示：存在文本模式下的数学命令（\\pi、^、_ 等）。"
+                "混排公式请包进 $...$，如 $S=\\pi r^2$；"
+                "用 -n 可查看生成的 .tex 核对\n")
         sys.stderr.write("\n提示：用 -k 保留工作目录可查看完整 .tex 与 .log\n")
         sys.exit(1)
     # 顺带报告缺字（不影响退出码，但用户需要知道中文是否渲染出来了）
@@ -1753,7 +2028,7 @@ def render(text: str, args: argparse.Namespace) -> None:
                 if args.verbose:
                     sys.stderr.write("sixeltex: 自动补充宏包: %s\n" % ", ".join(
                         "%s（命中 %s）" % (p, s) for p, s in auto))
-        body = wrap_expression(text, fields, args.math_scale)
+        body = wrap_expression(text, fields, args.math_scale, args.auto_math)
         # 按终端列宽折行，避免渲染出一行超长内容
         fields["body"] = wrap_body_for_width(body, width_setup)
         tex = TEMPLATE.format(**fields)
@@ -1864,6 +2139,7 @@ def build_parser() -> argparse.ArgumentParser:
   sixeltex '$E=mc^2$'                      带 $ 也行，自动剥掉
   echo 'x^2' | sixeltex                   标准输入
   sixeltex '中文测试: $f(x)=x^2$'           中英混排
+  sixeltex '圆的面积公式是 S=\\pi r^2。'    正文裸数学自动包 $...$
   sixeltex doc.tex                        完整 .tex 文件(含 \\documentclass)
   sixeltex -t beamer -C "Noto Sans CJK SC" '内容'
 
@@ -1944,6 +2220,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "固定底色的场合")
     p.add_argument("--no-wrap", action="store_true",
                    help="关闭按终端列宽自动折行（默认按探测到的列数限制排版宽度）")
+    p.add_argument("--no-auto-math", dest="auto_math", action="store_false",
+                   help="关闭正文中裸数学片段的自动 $...$ 包裹。默认开启："
+                        "混排文本里的 \\pi、^、_ 等数学命令会被自动包进 $...$"
+                        "（stderr 有提示）；已显式写好 $...$ 的内容不受影响")
     p.add_argument("--crop-width", action="store_true",
                    help="左右也按内容裁剪（默认只裁上下，左右保留整页宽度）")
     p.add_argument("-w", "--width", type=int, default=None,
